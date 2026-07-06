@@ -1,11 +1,11 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "jkg"
-version = "7.0.0"
-description = "JKG 7.0 — Unified Memory Fabric: profile, factual, episodic, and procedural memory in one SQLite database."
+version = "7.1.0"
+description = "JKG 7.1 — Unified Memory Fabric: semantic, profile, factual, episodic, and procedural memory in one SQLite database."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"

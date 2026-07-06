@@ -1,7 +1,7 @@
-# 🧠 Jessica Knowledge Graph 7.0
+# 🧠 Jessica Knowledge Graph 7.1
 
-> **Unified Memory Fabric — four-layer AI memory in a single SQLite transaction.**
-> Profile. Factual knowledge. Episodic sessions. Procedural skills. All fused by CLARK.
+> **Unified Memory Fabric — durable semantic memory plus profile, factual, episodic, and procedural recall in a single SQLite transaction.**
+> Project knowledge. Tool knowledge. Rules. Profile. Facts. Sessions. Skills. All fused by CLARK.
 > Local-first SQLite architecture with optional Gemini embeddings via `GEMINI_API_KEY`.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -15,9 +15,9 @@
 
 Every AI agent has **fragmented memory**. User preferences sit in one system. Factual knowledge in another. Session transcripts in a third. Skills in flat files. They don't talk to each other — and every retrieval means manually stitching together four separate queries.
 
-## What JKG 7.0 Is
+## What JKG 7.1 Is
 
-**One database. Four memory layers. One query.**
+**One database. Five memory layers. One query.**
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -36,10 +36,11 @@ Every AI agent has **fragmented memory**. User preferences sit in one system. Fa
      └────────┘ └────────┘ └───────────┘ └──────────────┘
 ```
 
-### Four Layers, One SQLite Database
+### Five Layers, One SQLite Database
 
 | Layer | Table | Purpose | Example |
 |-------|-------|---------|---------|
+| **Semantic** | `memory_semantic` | Stable project/tool/rule knowledge | `rule:file-safety -> never overwrite user-owned files without explicit approval` |
 | **Profile** | `memory_profile` | Identity, preferences, environment | `communication_style: warm but fast` |
 | **Factual** | `facts` + `entities` + `relations` | Knowledge graph with temporal validity | `alice works_at acme [2023→now]` |
 | **Episodic** | `memory_sessions` | Session transcripts + auto-summaries | `May 15: discussed memory architecture` |
@@ -85,7 +86,7 @@ pip install -e .
 export GEMINI_API_KEY=your_key_here
 ```
 
-If `GEMINI_API_KEY` is not set, JKG still runs but falls back to zero vectors, which degrades semantic retrieval quality.
+If `GEMINI_API_KEY` is not set, JKG still runs. It falls back to deterministic local hash embeddings, so semantic retrieval still works without cloud calls, just with lower quality than Gemini.
 
 ### Your First Memory
 
@@ -95,6 +96,11 @@ python3 -m jkg.memory remember "Alice is a software engineer at Acme Corp since 
 
 # Remember a user preference (profile layer)
 python3 -m jkg.memory remember-profile "Alice prefers concise, no-fluff answers"
+
+# Remember stable project / tool / rule knowledge (semantic layer)
+python3 -m jkg.memory remember-project "A Zone automates startup supply-side operations before scoring" "a-zone"
+python3 -m jkg.memory remember-tool "Hermes is the runtime behind Jessica" "Hermes"
+python3 -m jkg.memory remember-rule "Never overwrite user-owned files without approval" "file-safety"
 
 # Index a session transcript (episodic layer)
 python3 -m jkg.memory remember-session "session-001" "Discussed Q3 roadmap and memory architecture"
@@ -119,6 +125,9 @@ hm = HybridMemory()
 # ── Ingest ──────────────────────────────
 hm.remember("Alice works at Acme")                # factual
 hm.remember_profile("Alice prefers fast replies")  # profile
+hm.remember_project("A Zone prepares startups before investor matching", project="a-zone")
+hm.remember_tool("Hermes is Jessica's runtime", tool_name="Hermes")
+hm.remember_rule("Never overwrite user-owned files without approval", rule_name="file-safety")
 hm.remember_session("sess-001", "transcript...")  # episodic
 hm.index_skill("my-skill", description="...", triggers=["when ..."])  # procedural
 
@@ -167,6 +176,9 @@ Value Iteration     A* Search          Confidence Update
 ```
 unified_query("how does Alice communicate?")
   │
+  ├─► Semantic Layer: stable project/tool/rule retrieval
+  │    → "Hermes is the runtime behind Jessica" (score=0.96)
+  │
   ├─► Profile Layer:  key/value LIKE search + embedding fallback
   │    → "communication_style: fast" (score=0.92)
   │
@@ -187,6 +199,7 @@ CLARK-style fusion: sort by score, return top-N across layers
 
 ```
 memory_v3.db
+├── SEMANTIC       memory_semantic    (kind, scope, subject, canonical_key, statement)
 ├── PROFILE        memory_profile     (key, value, category, confidence)
 ├── FACTUAL        entities           (id, name, type, summary)
 │                  facts              (subject, predicate, object, temporal, confidence, utility)

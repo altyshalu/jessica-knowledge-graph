@@ -7,9 +7,15 @@ import os, sys, json, sqlite3, re, hashlib, math, time, heapq
 from datetime import datetime
 from collections import defaultdict, deque
 
-import requests
+try:
+    import requests
+except Exception:
+    requests = None
 import numpy as np
-from sentence_transformers import SentenceTransformer
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
 
 # ═══════════════════════════════════════════════════
 # CONFIG
@@ -49,8 +55,14 @@ _load_env()
 
 API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 API_BASE = "https://api.deepseek.com"
+LLM_TIMEOUT_SECONDS = float(os.environ.get("JKG_LLM_TIMEOUT_SECONDS", "20"))
+EMBEDDING_TIMEOUT_SECONDS = float(os.environ.get("JKG_EMBEDDING_TIMEOUT_SECONDS", "8"))
+SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("JKG_SQLITE_BUSY_TIMEOUT_MS", "15000"))
+SEMANTIC_EMBED_LIMIT = int(os.environ.get("JKG_SEMANTIC_EMBED_LIMIT", "12"))
 
 def _llm(prompt: str, system: str = "You are a precise knowledge extraction engine.") -> str:
+    if requests is None:
+        raise RuntimeError("requests is not installed; remote LLM extraction is unavailable")
     r = requests.post(
         f"{API_BASE}/v1/chat/completions",
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
@@ -58,7 +70,7 @@ def _llm(prompt: str, system: str = "You are a precise knowledge extraction engi
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ], "temperature": 0.1},
-        timeout=120,
+        timeout=LLM_TIMEOUT_SECONDS,
     )
     try:
         r.raise_for_status()
@@ -71,6 +83,11 @@ def _llm(prompt: str, system: str = "You are a precise knowledge extraction engi
 
 def _title_case_name(text: str) -> str:
     return " ".join(part.capitalize() for part in re.split(r"\s+", text.strip()) if part)
+
+
+def _slugify(text: str) -> str:
+    text = re.sub(r"[^a-zA-Zа-яА-Я0-9]+", "-", str(text or "").strip().lower())
+    return text.strip("-") or "item"
 
 
 def _fallback_profile_payload(text: str) -> dict:
@@ -99,6 +116,39 @@ def _fallback_profile_payload(text: str) -> dict:
         })
 
     return {"facts": facts}
+
+
+def _fallback_semantic_payload(
+    statement: str,
+    *,
+    kind: str,
+    scope: str,
+    subject: str = "",
+    canonical_key: str = "",
+    tags: list | None = None,
+    confidence: float = 0.9,
+) -> dict:
+    normalized_kind = (kind or "project").strip().lower()
+    inferred_subject = (subject or normalized_kind).strip()
+    inferred_tags = [str(tag).strip().lower() for tag in (tags or []) if str(tag).strip()]
+    topic_tokens = [
+        token for token in re.findall(r"[a-zA-Zа-яА-Я0-9_]+", statement.lower())
+        if token not in {"the", "and", "for", "with", "this", "that", "what", "how", "our", "your"}
+    ]
+    topic = "-".join(topic_tokens[:6]) or hashlib.md5(statement.encode()).hexdigest()[:8]
+    key = canonical_key or f"{normalized_kind}:{_slugify(scope)}:{_slugify(inferred_subject)}:{topic}"
+    return {
+        "entries": [{
+            "kind": normalized_kind,
+            "scope": scope,
+            "subject": inferred_subject,
+            "canonical_key": key,
+            "statement": statement.strip(),
+            "tags": inferred_tags,
+            "confidence": float(confidence),
+            "details": {},
+        }]
+    }
 
 
 def _fallback_extract_temporal_payload(text: str) -> dict:
@@ -235,10 +285,17 @@ class HybridMemory:
         if db_path not in (":memory:", "") and os.path.dirname(db_path):
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(
+            db_path,
+            timeout=max(SQLITE_BUSY_TIMEOUT_MS / 1000.0, 1.0),
+            check_same_thread=False,
+        )
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA temp_store=MEMORY")
 
         # Load sqlite-vec extension
         try:
@@ -259,33 +316,49 @@ class HybridMemory:
         if self._embedder is None:
             if _USE_GEMINI:
                 self._embedder = self  # Gemini — use self.encode()
+            elif SentenceTransformer is None:
+                self._embedder = self  # deterministic local hash embeddings
             else:
                 self._embedder = SentenceTransformer(self._embedder_name)
         return self._embedder
+
+    def _hash_embed(self, text: str):
+        vec = np.zeros(EMBEDDING_DIM, dtype=np.float32)
+        tokens = re.findall(r"[^\s,?.!;:\"'()\[\]{}]+", str(text or "").lower())
+        if not tokens:
+            tokens = [str(text or "")]
+        for token in tokens:
+            digest = hashlib.sha256(token.encode("utf-8")).digest()
+            for idx in range(0, len(digest), 4):
+                bucket = int.from_bytes(digest[idx:idx + 4], "big") % EMBEDDING_DIM
+                vec[bucket] += 1.0
+        norm = np.linalg.norm(vec)
+        return vec / norm if norm > 0 else vec
         
     def encode(self, texts, **kwargs):
         """Unified encode: delegates to Gemini API or SentenceTransformer."""
-        import requests as _requests
         import numpy as _np
         
         # If we're a SentenceTransformer instance (set by embedder property)
-        if isinstance(self._embedder, SentenceTransformer):
+        if SentenceTransformer is not None and isinstance(self._embedder, SentenceTransformer):
             return self._embedder.encode(texts, normalize_embeddings=True, **kwargs)
+        if not _USE_GEMINI:
+            if isinstance(texts, str):
+                return self._hash_embed(texts)
+            return [self._hash_embed(text) for text in texts]
         
         # Gemini API path
         api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            print("WARNING: GEMINI_API_KEY not set. Returning zero vectors.", file=sys.stderr)
-            dim = EMBEDDING_DIM
+        if not api_key or requests is None:
             if isinstance(texts, str):
-                return _np.zeros(dim, dtype=_np.float32)
-            return [_np.zeros(dim, dtype=_np.float32) for _ in texts]
+                return self._hash_embed(texts)
+            return [self._hash_embed(text) for text in texts]
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={api_key}"
         
         def _call_gemini(text):
             payload = {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": text}]}}
-            resp = _requests.post(url, json=payload, timeout=30).json()
+            resp = requests.post(url, json=payload, timeout=EMBEDDING_TIMEOUT_SECONDS).json()
             if "embedding" not in resp:
                 print(f"Error from Gemini API: {resp}", file=sys.stderr)
                 return _np.zeros(EMBEDDING_DIM, dtype=_np.float32)
@@ -452,6 +525,29 @@ class HybridMemory:
             );
             CREATE INDEX IF NOT EXISTS idx_skills_name ON memory_skills(name);
             CREATE INDEX IF NOT EXISTS idx_skills_category ON memory_skills(category);
+
+            -- SEMANTIC Layer: durable project/tool/rule knowledge
+            CREATE TABLE IF NOT EXISTS memory_semantic (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                semantic_id TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                scope TEXT DEFAULT 'global',
+                subject TEXT DEFAULT '',
+                canonical_key TEXT NOT NULL UNIQUE,
+                statement TEXT NOT NULL,
+                details_json TEXT DEFAULT '{}',
+                tags_json TEXT DEFAULT '[]',
+                confidence REAL DEFAULT 0.9,
+                source TEXT DEFAULT 'manual',
+                status TEXT DEFAULT 'active',
+                access_count INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+                last_reinforced_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_semantic_kind ON memory_semantic(kind);
+            CREATE INDEX IF NOT EXISTS idx_semantic_scope ON memory_semantic(scope);
+            CREATE INDEX IF NOT EXISTS idx_semantic_subject ON memory_semantic(subject);
         """)
         self.conn.commit()
 
@@ -467,6 +563,16 @@ class HybridMemory:
         except Exception:
             self.has_vec = False
             print("WARNING: vec0 not available, vector search disabled", file=sys.stderr)
+        if self.has_vec:
+            try:
+                self.conn.execute(f"""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS memory_semantic_vec USING vec0(
+                        semantic_row_id INTEGER PRIMARY KEY,
+                        embedding float[{EMBEDDING_DIM}]
+                    )
+                """)
+            except Exception:
+                pass
 
     # ═══════════════════════════════════════════════
     # UTILS
@@ -2406,6 +2512,323 @@ JSON:"""
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # ── SEMANTIC LAYER ────────────────────────────────────────────
+
+    def _semantic_id(self, canonical_key: str) -> str:
+        return hashlib.md5(canonical_key.encode("utf-8")).hexdigest()[:16]
+
+    def _semantic_topic_from_statement(self, statement: str) -> str:
+        tokens = [
+            token for token in re.findall(r"[a-zA-Zа-яА-Я0-9_]+", statement.lower())
+            if token not in {"the", "and", "for", "with", "this", "that", "what", "how", "our", "your", "from"}
+        ]
+        return "-".join(tokens[:6]) or hashlib.md5(statement.encode("utf-8")).hexdigest()[:8]
+
+    def _build_semantic_key(self, kind: str, scope: str, subject: str, statement: str) -> str:
+        return ":".join([
+            _slugify(kind or "project"),
+            _slugify(scope or "global"),
+            _slugify(subject or kind or "memory"),
+            _slugify(self._semantic_topic_from_statement(statement)),
+        ])
+
+    def _remember_semantic_entry(
+        self,
+        *,
+        kind: str,
+        scope: str,
+        subject: str,
+        statement: str,
+        canonical_key: str = "",
+        tags: list | None = None,
+        details: dict | None = None,
+        confidence: float = 0.9,
+        source: str = "manual",
+    ) -> dict:
+        normalized_kind = self._norm(kind or "project")
+        normalized_scope = (scope or "global").strip()
+        normalized_subject = (subject or normalized_kind).strip()
+        normalized_statement = statement.strip()
+        key = canonical_key or self._build_semantic_key(
+            normalized_kind, normalized_scope, normalized_subject, normalized_statement
+        )
+        semantic_id = self._semantic_id(key)
+        tags_json = json.dumps(sorted({str(tag).strip().lower() for tag in (tags or []) if str(tag).strip()}), ensure_ascii=False)
+        details_json = json.dumps(details or {}, ensure_ascii=False, sort_keys=True)
+
+        existing = self.conn.execute(
+            "SELECT id, access_count FROM memory_semantic WHERE canonical_key=?",
+            (key,),
+        ).fetchone()
+
+        if existing:
+            self.conn.execute("""
+                UPDATE memory_semantic
+                SET kind=?, scope=?, subject=?, statement=?, details_json=?, tags_json=?,
+                    confidence=?, source=?, status='active', updated_at=datetime('now'),
+                    last_reinforced_at=datetime('now')
+                WHERE canonical_key=?
+            """, (
+                normalized_kind, normalized_scope, normalized_subject, normalized_statement,
+                details_json, tags_json, float(confidence), source, key,
+            ))
+            row_id = existing["id"]
+            action = "updated"
+        else:
+            cur = self.conn.execute("""
+                INSERT INTO memory_semantic(
+                    semantic_id, kind, scope, subject, canonical_key, statement,
+                    details_json, tags_json, confidence, source
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                semantic_id, normalized_kind, normalized_scope, normalized_subject, key,
+                normalized_statement, details_json, tags_json, float(confidence), source,
+            ))
+            row_id = cur.lastrowid
+            action = "created"
+
+        if self.has_vec:
+            try:
+                semantic_text = " ".join([
+                    normalized_kind, normalized_scope, normalized_subject,
+                    normalized_statement, " ".join(json.loads(tags_json)),
+                ]).strip()
+                vec = self._encode(semantic_text)
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO memory_semantic_vec(semantic_row_id, embedding) VALUES(?,?)",
+                    (row_id, vec.tobytes()),
+                )
+            except Exception:
+                pass
+
+        self.conn.commit()
+        return {
+            "status": "ok",
+            "action": action,
+            "semantic_id": semantic_id,
+            "canonical_key": key,
+            "kind": normalized_kind,
+            "scope": normalized_scope,
+            "subject": normalized_subject,
+            "statement": normalized_statement,
+        }
+
+    def remember_semantic(
+        self,
+        statement: str,
+        *,
+        kind: str = "project",
+        scope: str = "global",
+        subject: str = "",
+        canonical_key: str = "",
+        tags: list | None = None,
+        details: dict | None = None,
+        confidence: float = 0.9,
+        source: str = "manual",
+    ) -> dict:
+        """Store durable semantic knowledge about the project, tools, or rules."""
+        try:
+            prompt = f"""Extract durable semantic memory entries from this text. Output ONLY valid JSON.
+
+Text: {statement[:3000]}
+
+Format:
+{{"entries":[{{
+  "kind":"project|tool|rule",
+  "scope":"workspace/project/team/global",
+  "subject":"short subject",
+  "canonical_key":"stable_key_or_empty",
+  "statement":"durable truth",
+  "tags":["tag1","tag2"],
+  "confidence":0.0-1.0,
+  "details":{{}}
+}}]}}
+
+Only extract stable knowledge worth remembering across sessions.
+Skip one-off events, timestamps, and transient chat context.
+JSON:"""
+            raw = _llm(prompt, "You extract durable semantic memory. Output JSON only.")
+            payload = json.loads(raw.strip().replace("```json", "").replace("```", ""))
+        except Exception:
+            payload = _fallback_semantic_payload(
+                statement,
+                kind=kind,
+                scope=scope,
+                subject=subject,
+                canonical_key=canonical_key,
+                tags=tags,
+                confidence=confidence,
+            )
+
+        stored = []
+        for entry in payload.get("entries", []):
+            stored.append(self._remember_semantic_entry(
+                kind=entry.get("kind", kind),
+                scope=entry.get("scope", scope),
+                subject=entry.get("subject", subject),
+                statement=entry.get("statement", statement),
+                canonical_key=canonical_key or entry.get("canonical_key", ""),
+                tags=entry.get("tags", tags),
+                details=entry.get("details", details),
+                confidence=float(entry.get("confidence", confidence)),
+                source=source,
+            ))
+        return {"status": "ok", "stored": len(stored), "entries": stored}
+
+    def remember_project(
+        self,
+        statement: str,
+        *,
+        project: str = "default",
+        canonical_key: str = "",
+        tags: list | None = None,
+        details: dict | None = None,
+        confidence: float = 0.95,
+        source: str = "manual",
+    ) -> dict:
+        return self._remember_semantic_entry(
+            kind="project",
+            scope=project,
+            subject=project,
+            statement=statement,
+            canonical_key=canonical_key,
+            tags=(tags or []) + ["project"],
+            details=details,
+            confidence=confidence,
+            source=source,
+        )
+
+    def remember_tool(
+        self,
+        statement: str,
+        *,
+        tool_name: str,
+        canonical_key: str = "",
+        tags: list | None = None,
+        details: dict | None = None,
+        confidence: float = 0.93,
+        source: str = "manual",
+    ) -> dict:
+        return self._remember_semantic_entry(
+            kind="tool",
+            scope="tooling",
+            subject=tool_name,
+            statement=statement,
+            canonical_key=canonical_key,
+            tags=(tags or []) + ["tool", _slugify(tool_name)],
+            details=details,
+            confidence=confidence,
+            source=source,
+        )
+
+    def remember_rule(
+        self,
+        statement: str,
+        *,
+        rule_name: str,
+        canonical_key: str = "",
+        tags: list | None = None,
+        details: dict | None = None,
+        confidence: float = 0.97,
+        source: str = "manual",
+    ) -> dict:
+        return self._remember_semantic_entry(
+            kind="rule",
+            scope="rules",
+            subject=rule_name,
+            statement=statement,
+            canonical_key=canonical_key,
+            tags=(tags or []) + ["rule", _slugify(rule_name)],
+            details=details,
+            confidence=confidence,
+            source=source,
+        )
+
+    def list_semantic(self, kind: str = None, scope: str = None, limit: int = 50) -> list:
+        clauses = ["status='active'"]
+        params = []
+        if kind:
+            clauses.append("kind=?")
+            params.append(self._norm(kind))
+        if scope:
+            clauses.append("scope=?")
+            params.append(scope)
+        rows = self.conn.execute(
+            f"SELECT * FROM memory_semantic WHERE {' AND '.join(clauses)} "
+            "ORDER BY kind, confidence DESC, updated_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["tags"] = json.loads(item.get("tags_json", "[]"))
+            item["details"] = json.loads(item.get("details_json", "{}"))
+            results.append(item)
+        return results
+
+    def search_semantic(self, query: str, limit: int = 8, kind: str = None) -> list:
+        norm_q = self._norm(query)
+        terms = [term for term in re.findall(r"[a-zA-Zа-яА-Я0-9_]+", norm_q) if len(term) > 1]
+        base_rows = self.list_semantic(kind=kind, limit=250)
+        if not base_rows:
+            return []
+
+        q_vec = None
+        lexical_candidates = []
+        embedding_candidates = []
+        for row in base_rows:
+            searchable = " ".join([
+                row.get("kind", ""), row.get("scope", ""), row.get("subject", ""),
+                row.get("canonical_key", ""), row.get("statement", ""),
+                " ".join(row.get("tags", [])),
+            ]).strip()
+            lexical_hits = sum(1 for term in terms if term in searchable.lower())
+            lexical_bonus = self._keyword_overlap_bonus(
+                query, row.get("subject", ""), row.get("kind", ""), row.get("statement", "")
+            )
+            candidate = (lexical_hits, lexical_bonus, searchable, row)
+            if lexical_hits > 0 or lexical_bonus > 0:
+                lexical_candidates.append(candidate)
+            else:
+                embedding_candidates.append(candidate)
+
+        results = []
+        for lexical_hits, lexical_bonus, _searchable, row in lexical_candidates:
+            item = dict(row)
+            item["layer"] = "semantic"
+            item["cosine_sim"] = None
+            item["score"] = round((item.get("confidence", 0.5) * 0.55) + lexical_bonus + (lexical_hits * 0.12), 4)
+            results.append(item)
+
+        # Remote embeddings are expensive and were the main source of query stalls.
+        # Only score a small fallback slice when lexical search did not already fill the request.
+        if len(results) < limit and embedding_candidates:
+            try:
+                q_vec = self._encode(query)
+                for lexical_hits, lexical_bonus, searchable, row in embedding_candidates[:SEMANTIC_EMBED_LIMIT]:
+                    entry_vec = self._encode(searchable)
+                    cosine = float(np.dot(q_vec, entry_vec) / ((np.linalg.norm(q_vec) * np.linalg.norm(entry_vec)) + 1e-8))
+                    if terms and cosine < 0.18:
+                        continue
+                    item = dict(row)
+                    item["layer"] = "semantic"
+                    item["cosine_sim"] = cosine
+                    item["score"] = round((item.get("confidence", 0.5) * 0.45) + (cosine * 0.4) + lexical_bonus + (lexical_hits * 0.08), 4)
+                    results.append(item)
+            except Exception:
+                pass
+
+        results.sort(key=lambda item: item.get("score", 0), reverse=True)
+        top = results[:limit]
+        if top:
+            self.conn.executemany(
+                "UPDATE memory_semantic SET access_count = access_count + 1, last_reinforced_at=datetime('now') WHERE id=?",
+                [(item["id"],) for item in top],
+            )
+            self.conn.commit()
+        return top
+
     # ── EPISODIC LAYER ────────────────────────────────────────────
 
     def remember_session(self, session_id: str, text: str, source: str = "terminal",
@@ -2543,18 +2966,29 @@ JSON:"""
 
         Args:
             text: natural language query
-            layers: subset of ['profile','factual','episodic','procedural'] (default: all)
+            layers: subset of ['semantic','profile','factual','episodic','procedural'] (default: all)
             limit: max results per layer before fusion
 
         Returns:
             dict with 'results' (ranked across layers) and 'by_layer' breakdown
         """
         if layers is None:
-            layers = ["profile", "factual", "episodic", "procedural"]
+            layers = ["semantic", "profile", "factual", "episodic", "procedural"]
 
         all_results = []
         by_layer = {}
+        errors = {}
         timeframe = self._extract_query_timeframe(text)
+
+        # ── Semantic Layer ──
+        if "semantic" in layers and timeframe.get("mode") == "any":
+            try:
+                semantic_results = self.search_semantic(text, limit=limit)
+                by_layer["semantic"] = len(semantic_results)
+                all_results.extend(semantic_results)
+            except Exception as exc:
+                by_layer["semantic"] = 0
+                errors["semantic"] = str(exc)[:200]
 
         # ── Profile Layer ──
         if "profile" in layers and timeframe.get("mode") == "any":
@@ -2671,44 +3105,65 @@ JSON:"""
                 all_results.extend(factual_results)
             except Exception as e:
                 # Fallback to RRF recall
-                factual_results = self.recall(text, limit=limit * 3)
-                filtered_factual = []
-                for r in factual_results:
-                    metadata = self._get_fact_metadata(
-                        r.get("entity", ""),
-                        r.get("predicate", ""),
-                        r.get("value", r.get("object_text", ""))
-                    )
-                    if metadata:
-                        r["valid_from"] = metadata["valid_from"]
-                        r["valid_until"] = metadata["valid_until"]
-                        r["confidence"] = metadata["confidence"]
-                        if not self._fact_matches_timeframe(metadata["valid_from"], metadata["valid_until"], timeframe):
-                            continue
-                    r["layer"] = "factual"
-                    r["score"] = r.get("rrf_score", 0.5)
-                    filtered_factual.append(r)
-                factual_results = filtered_factual[:limit]
-                by_layer["factual"] = len(factual_results)
-                all_results.extend(factual_results)
+                errors["factual_clark"] = str(e)[:200]
+                try:
+                    factual_results = self.recall(text, limit=limit * 3)
+                    filtered_factual = []
+                    for r in factual_results:
+                        metadata = self._get_fact_metadata(
+                            r.get("entity", ""),
+                            r.get("predicate", ""),
+                            r.get("value", r.get("object_text", ""))
+                        )
+                        if metadata:
+                            r["valid_from"] = metadata["valid_from"]
+                            r["valid_until"] = metadata["valid_until"]
+                            r["confidence"] = metadata["confidence"]
+                            if not self._fact_matches_timeframe(metadata["valid_from"], metadata["valid_until"], timeframe):
+                                continue
+                        r["layer"] = "factual"
+                        r["score"] = r.get("rrf_score", 0.5)
+                        filtered_factual.append(r)
+                    factual_results = filtered_factual[:limit]
+                    by_layer["factual"] = len(factual_results)
+                    all_results.extend(factual_results)
+                except Exception as fallback_exc:
+                    by_layer["factual"] = 0
+                    errors["factual"] = str(fallback_exc)[:200]
 
         # ── Episodic Layer ──
         if "episodic" in layers:
-            ep_results = self.search_sessions(text, limit=limit)
-            for r in ep_results:
-                r["layer"] = "episodic"
-                r["score"] = float(r.get("importance", 0.5)) * 0.7  # sessions are contextual
-            by_layer["episodic"] = len(ep_results)
-            all_results.extend(ep_results)
+            try:
+                ep_results = self.search_sessions(text, limit=limit)
+                raw_episodes = self.search_episodes(text, limit=limit)
+                seen_episode_keys = {r.get("session_id") or r.get("id") for r in ep_results}
+                for episode in raw_episodes:
+                    key = episode.get("uuid") or episode.get("id")
+                    if key in seen_episode_keys:
+                        continue
+                    episode["importance"] = 0.45
+                    ep_results.append(episode)
+                for r in ep_results:
+                    r["layer"] = "episodic"
+                    r["score"] = float(r.get("importance", 0.5)) * 0.7  # sessions are contextual
+                by_layer["episodic"] = len(ep_results)
+                all_results.extend(ep_results)
+            except Exception as exc:
+                by_layer["episodic"] = 0
+                errors["episodic"] = str(exc)[:200]
 
         # ── Procedural Layer ──
         if "procedural" in layers:
-            sk_results = self.search_skills(text, limit=limit)
-            for r in sk_results:
-                r["layer"] = "procedural"
-                r["score"] = 0.65  # skills are always relevant if matched
-            by_layer["procedural"] = len(sk_results)
-            all_results.extend(sk_results)
+            try:
+                sk_results = self.search_skills(text, limit=limit)
+                for r in sk_results:
+                    r["layer"] = "procedural"
+                    r["score"] = 0.65  # skills are always relevant if matched
+                by_layer["procedural"] = len(sk_results)
+                all_results.extend(sk_results)
+            except Exception as exc:
+                by_layer["procedural"] = 0
+                errors["procedural"] = str(exc)[:200]
 
         # ── CLARK-style fusion: sort by score, deduplicate ──
         all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -2719,6 +3174,7 @@ JSON:"""
             "layers_searched": layers,
             "total_candidates": sum(by_layer.values()),
             "by_layer": by_layer,
+            "errors": errors,
             "results": top
         }
 
@@ -2791,7 +3247,26 @@ JSON:"""
         except Exception:
             pass
 
-        # 4. Relevant skills (most recently updated)
+        # 4. Stable semantic memory for project / tools / rules
+        try:
+            semantic = self.list_semantic(limit=18)
+            if semantic:
+                grouped = defaultdict(list)
+                for item in semantic:
+                    grouped[item.get("kind", "project")].append(item)
+
+                semantic_lines = []
+                for label, kind in [("Project", "project"), ("Tools", "tool"), ("Rules", "rule")]:
+                    for item in grouped.get(kind, [])[:6]:
+                        semantic_lines.append(
+                            f"  [{label}] {item.get('subject')}: {item.get('statement')[:140]}"
+                        )
+                if semantic_lines:
+                    blocks.append("[Semantic Memory]\n" + "\n".join(semantic_lines))
+        except Exception:
+            pass
+
+        # 5. Relevant skills (most recently updated)
         try:
             skills = self.conn.execute("""
                 SELECT name, description, category
@@ -2841,6 +3316,49 @@ JSON:"""
         """Bridge from skill create/update → JKG 7.0 procedural layer."""
         return self.index_skill(name=name, description=description,
                                 triggers=triggers, category=category)
+
+    def sync_semantic_context(
+        self,
+        *,
+        project: list | None = None,
+        tools: list | None = None,
+        rules: list | None = None,
+        scope: str = "default",
+        source: str = "sync",
+    ) -> dict:
+        """Bulk-ingest stable project/tool/rule knowledge into the semantic layer."""
+        stored = []
+        for item in project or []:
+            stored.append(self.remember_project(
+                item["statement"],
+                project=item.get("project", scope),
+                canonical_key=item.get("canonical_key", ""),
+                tags=item.get("tags"),
+                details=item.get("details"),
+                confidence=float(item.get("confidence", 0.95)),
+                source=source,
+            ))
+        for item in tools or []:
+            stored.append(self.remember_tool(
+                item["statement"],
+                tool_name=item.get("tool_name") or item.get("subject") or "tool",
+                canonical_key=item.get("canonical_key", ""),
+                tags=item.get("tags"),
+                details=item.get("details"),
+                confidence=float(item.get("confidence", 0.93)),
+                source=source,
+            ))
+        for item in rules or []:
+            stored.append(self.remember_rule(
+                item["statement"],
+                rule_name=item.get("rule_name") or item.get("subject") or "rule",
+                canonical_key=item.get("canonical_key", ""),
+                tags=item.get("tags"),
+                details=item.get("details"),
+                confidence=float(item.get("confidence", 0.97)),
+                source=source,
+            ))
+        return {"status": "ok", "stored": len(stored), "entries": stored}
 
     def migrate_builtin_memory(self, memory_data: str) -> dict:
         """One-shot: migrate existing flat memory injection into JKG profile layer.
@@ -2892,6 +3410,12 @@ JSON:"""
         return _llm(prompt, "You extract knowledge graph triples. Always create relations. Output JSON only.")
     except Exception:
         return json.dumps(_fallback_extract_entities_payload(text), ensure_ascii=False)
+
+
+def main_cli():
+    """Entry point for `python -m jkg.memory` and the `jkg` console script."""
+    import runpy
+    runpy.run_path(os.path.abspath(__file__), run_name="__main__")
 
 
 # ═══════════════════════════════════════════════
@@ -3024,7 +3548,7 @@ if __name__ == "__main__":
     elif cmd == "query":
         query = " ".join(sys.argv[2:])
         layers = None
-        # Support: query --layers profile,factual "text"
+        # Support: query --layers semantic,profile,factual "text"
         if "--layers" in sys.argv:
             idx = sys.argv.index("--layers")
             layers = sys.argv[idx+1].split(",")
@@ -3036,6 +3560,8 @@ if __name__ == "__main__":
             layer_tag = f"[{r['layer']}]"
             if r["layer"] == "profile":
                 print(f"  {layer_tag} {r['key']}: {r['value']} (conf={r.get('confidence','?')})")
+            elif r["layer"] == "semantic":
+                print(f"  {layer_tag} [{r.get('kind','?')}] {r.get('subject','?')}: {r.get('statement','')} (score={r.get('score','?')})")
             elif r["layer"] == "factual":
                 print(f"  {layer_tag} {r.get('entity','?')} {r.get('predicate','?')} {r.get('value', r.get('object_text','?'))} (score={r.get('score','?')})")
             elif r["layer"] == "episodic":
@@ -3063,6 +3589,29 @@ if __name__ == "__main__":
         result = hm.index_skill(name, description=desc)
         print(json.dumps(result, ensure_ascii=False))
 
+    elif cmd == "remember-project":
+        project = sys.argv[2] if len(sys.argv) > 2 else "default"
+        text = sys.stdin.read() if not sys.stdin.isatty() else " ".join(sys.argv[3:])
+        result = hm.remember_project(text, project=project)
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif cmd == "remember-tool":
+        tool_name = sys.argv[2] if len(sys.argv) > 2 else "tool"
+        text = sys.stdin.read() if not sys.stdin.isatty() else " ".join(sys.argv[3:])
+        result = hm.remember_tool(text, tool_name=tool_name)
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif cmd == "remember-rule":
+        rule_name = sys.argv[2] if len(sys.argv) > 2 else "rule"
+        text = sys.stdin.read() if not sys.stdin.isatty() else " ".join(sys.argv[3:])
+        result = hm.remember_rule(text, rule_name=rule_name)
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif cmd == "semantic":
+        kind = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else None
+        for item in hm.list_semantic(kind=kind):
+            print(f"  [{item['kind']}] {item['subject']}: {item['statement']} (key={item['canonical_key']})")
+
     elif cmd == "migrate-memory":
         text = sys.stdin.read() if not sys.stdin.isatty() else " ".join(sys.argv[2:])
         result = hm.migrate_builtin_memory(text)
@@ -3083,4 +3632,5 @@ if __name__ == "__main__":
               "stats, entities, forget, episodes, resolve, invalidate, "
               "utility, prune, propagate, emotions, evolve, gdpr-delete, "
               "query, session-start, remember-profile, remember-session, "
-              "index-skill, migrate-memory, profile, sessions")
+              "index-skill, remember-project, remember-tool, remember-rule, "
+              "semantic, migrate-memory, profile, sessions")
