@@ -25,8 +25,12 @@ DB_PATH = os.path.expanduser(os.environ.get(
     "JKG_DB_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_v3.db")
 ))
-# Default: local SentenceTransformer (384-dim). Set GEMINI_API_KEY for Gemini (768-dim).
-_USE_GEMINI = bool(os.environ.get("GEMINI_API_KEY", ""))
+# Embedding selection is explicit. The presence of a provider credential must
+# never silently change retrieval, cost, or data-egress behavior.
+EMBEDDING_BACKEND = os.environ.get("JKG_EMBEDDING_BACKEND", "local").strip().lower()
+if EMBEDDING_BACKEND not in {"local", "gemini"}:
+    raise RuntimeError("JKG_EMBEDDING_BACKEND must be 'local' or 'gemini'")
+_USE_GEMINI = EMBEDDING_BACKEND == "gemini"
 EMBEDDING_DIM = 768 if _USE_GEMINI else 384
 EMBEDDING_MODEL = os.environ.get(
     "JKG_EMBEDDING_MODEL",
@@ -55,12 +59,17 @@ _load_env()
 
 API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 API_BASE = "https://api.deepseek.com"
+LLM_BACKEND = os.environ.get("JKG_LLM_BACKEND", "disabled").strip().lower()
 LLM_TIMEOUT_SECONDS = float(os.environ.get("JKG_LLM_TIMEOUT_SECONDS", "20"))
 EMBEDDING_TIMEOUT_SECONDS = float(os.environ.get("JKG_EMBEDDING_TIMEOUT_SECONDS", "8"))
 SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("JKG_SQLITE_BUSY_TIMEOUT_MS", "15000"))
 SEMANTIC_EMBED_LIMIT = int(os.environ.get("JKG_SEMANTIC_EMBED_LIMIT", "12"))
 
 def _llm(prompt: str, system: str = "You are a precise knowledge extraction engine.") -> str:
+    if LLM_BACKEND != "deepseek":
+        raise RuntimeError("JKG LLM extraction is disabled; set JKG_LLM_BACKEND=deepseek explicitly to enable it")
+    if not API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY is required when JKG_LLM_BACKEND=deepseek")
     if requests is None:
         raise RuntimeError("requests is not installed; remote LLM extraction is unavailable")
     r = requests.post(
@@ -317,7 +326,7 @@ class HybridMemory:
             if _USE_GEMINI:
                 self._embedder = self  # Gemini — use self.encode()
             elif SentenceTransformer is None:
-                self._embedder = self  # deterministic local hash embeddings
+                raise RuntimeError("sentence-transformers is required for JKG_EMBEDDING_BACKEND=local")
             else:
                 self._embedder = SentenceTransformer(self._embedder_name)
         return self._embedder
@@ -343,26 +352,23 @@ class HybridMemory:
         if SentenceTransformer is not None and isinstance(self._embedder, SentenceTransformer):
             return self._embedder.encode(texts, normalize_embeddings=True, **kwargs)
         if not _USE_GEMINI:
-            if isinstance(texts, str):
-                return self._hash_embed(texts)
-            return [self._hash_embed(text) for text in texts]
+            raise RuntimeError("local embeddings must be provided by sentence-transformers")
         
         # Gemini API path
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key or requests is None:
-            if isinstance(texts, str):
-                return self._hash_embed(texts)
-            return [self._hash_embed(text) for text in texts]
+            raise RuntimeError("Gemini embeddings require requests and GEMINI_API_KEY")
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={api_key}"
         
         def _call_gemini(text):
             payload = {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": text}]}}
-            resp = requests.post(url, json=payload, timeout=EMBEDDING_TIMEOUT_SECONDS).json()
-            if "embedding" not in resp:
-                print(f"Error from Gemini API: {resp}", file=sys.stderr)
-                return _np.zeros(EMBEDDING_DIM, dtype=_np.float32)
-            vals = resp["embedding"]["values"]
+            response = requests.post(url, json=payload, timeout=EMBEDDING_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            payload = response.json()
+            if "embedding" not in payload:
+                raise RuntimeError("Gemini embedding response did not contain an embedding")
+            vals = payload["embedding"]["values"]
             dim = EMBEDDING_DIM
             if len(vals) > dim:
                 vals = vals[:dim]
@@ -563,7 +569,7 @@ class HybridMemory:
         except Exception:
             self.has_vec = False
             print("WARNING: vec0 not available, vector search disabled", file=sys.stderr)
-        if self.has_vec:
+        if self.has_vec and self._has_fact_vectors():
             try:
                 self.conn.execute(f"""
                     CREATE VIRTUAL TABLE IF NOT EXISTS memory_semantic_vec USING vec0(
@@ -1655,6 +1661,13 @@ JSON:"""
         # ── RRF FUSION ──
         return self._rrf_fusion(results_lists, graph_facts, limit)
 
+    def _has_fact_vectors(self) -> bool:
+        """Return whether the persistent fact index has usable vectors."""
+        try:
+            return bool(self.conn.execute("SELECT 1 FROM facts_vec LIMIT 1").fetchone())
+        except Exception:
+            return False
+
     def _fts_query(self, query: str) -> str:
         """Convert user query to FTS5 query string."""
         words = [w for w in re.findall(r'[^\s,?.!;:"\'()\[\]{}]+', query) if len(w) > 1]
@@ -1892,6 +1905,10 @@ JSON:"""
         return scored[:limit]
 
     def retrieve_clark(self, query: str, top_k: int = 10, beam_width: int = 5) -> list:
+        """Retrieve from persisted indexes without re-embedding the graph per request."""
+        return self.recall(query, limit=top_k)
+
+    def _retrieve_clark_exhaustive_legacy(self, query: str, top_k: int = 10, beam_width: int = 5) -> list:
         """Stage 2: A* search on the confidence-propagated graph.
         
         Uses temporal-aware heuristic:
