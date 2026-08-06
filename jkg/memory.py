@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JKG 5.1 — HYBRID Memory: Graph + Embeddings + Temporal + Emotional + Forgetting + Self-Evolving.
+JKG 7.1 — Unified Memory Fabric: semantic, profile, factual, episodic, and procedural memory.
 ONE SQLite database. Zero conflicts. No external APIs except LLM extraction.
 """
 import os, sys, json, sqlite3, re, hashlib, math, time, heapq
@@ -278,7 +278,7 @@ def _fallback_extract_entities_payload(text: str) -> dict:
 # ═══════════════════════════════════════════════════
 
 class HybridMemory:
-    """JKG 3.0: graph + embeddings in ONE SQLite database. Zero conflicts."""
+    """Unified five-layer memory backed by one SQLite database."""
 
     def __init__(self, db_path=DB_PATH, embedding_model=EMBEDDING_MODEL):
         # Handle special SQLite paths like ":memory:"
@@ -3283,7 +3283,7 @@ JSON:"""
             pass
 
         # Build final injection block
-        header = "DYNAMIC CONTEXT (JKG 7.0 Unified Memory Fabric)"
+        header = "DYNAMIC CONTEXT (JKG 7.1 Unified Memory Fabric)"
         body = "\n\n".join(blocks) if blocks else "(no context loaded)"
 
         return f"══════════════════════════════════════════════\n{header}\n══════════════════════════════════════════════\n{body}"

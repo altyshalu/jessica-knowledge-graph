@@ -1,7 +1,7 @@
-# JKG 7.0 (Jessica Knowledge Graph) - Architecture Audit & Fix Checklist
+# JKG 7.1 (Jessica Knowledge Graph) — Architecture Audit & Fix Checklist
 
 ## Current Situation
-JKG 7.0 is an ambitious "Unified Memory Fabric" that merges 4 distinct memory layers (Profile, Factual, Episodic, Procedural) into a single SQLite database using `sqlite-vec`. 
+JKG 7.1 is a "Unified Memory Fabric" that merges five memory layers (Semantic, Profile, Factual, Episodic, and Procedural) into a single SQLite database using `sqlite-vec`.
 During automated stress testing (8 edge-case tests on the `teston` profile), the system passed multi-layer fusion and schema evolution but failed critically on temporal reasoning, conflict resolution, data deletion, and dependency management.
 
 ## Bug Checklist & Remediation Plan

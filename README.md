@@ -1,323 +1,210 @@
-# 🧠 Jessica Knowledge Graph 7.1
+<div align="center">
 
-> **Unified Memory Fabric — durable semantic memory plus profile, factual, episodic, and procedural recall in a single SQLite transaction.**
-> Project knowledge. Tool knowledge. Rules. Profile. Facts. Sessions. Skills. All fused by CLARK.
-> Local-first SQLite architecture with optional Gemini embeddings via `GEMINI_API_KEY`.
+# 🧠 Jessica Knowledge Graph
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![LongMemEval](https://img.shields.io/badge/LongMemEval--S-96.8%25%20R@5-green.svg)](https://arxiv.org/abs/2410.10813)
-[![Lines](https://img.shields.io/badge/code-2622%20lines-purple.svg)](jkg/memory.py)
+### One local database for semantic, profile, factual, episodic, and procedural memory
+
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Version](https://img.shields.io/badge/version-7.1.0-7C3AED)](https://github.com/altyshalu/jessica-knowledge-graph)
+[![License: MIT](https://img.shields.io/badge/license-MIT-22C55E)](LICENSE)
+[![Status: Beta](https://img.shields.io/badge/status-beta-F59E0B)](#project-status)
+
+**Local-first · SQLite-backed · Unified retrieval · Optional cloud embeddings**
+
+</div>
 
 ---
 
-## The Problem
+Jessica Knowledge Graph (JKG) is a Python memory engine that keeps five kinds of knowledge in one SQLite database and retrieves them through one query interface. It combines structured knowledge graphs, full-text search, vector similarity, temporal validity, and CLARK ranking without requiring an external database for recall.
 
-Every AI agent has **fragmented memory**. User preferences sit in one system. Factual knowledge in another. Session transcripts in a third. Skills in flat files. They don't talk to each other — and every retrieval means manually stitching together four separate queries.
+## Why JKG
 
-## What JKG 7.1 Is
+Memory-heavy applications often split preferences, facts, transcripts, rules, and workflows across unrelated stores. JKG keeps those layers transactionally consistent in a single database:
 
-**One database. Five memory layers. One query.**
+| Layer | Stores | Example |
+|---|---|---|
+| **Semantic** | Durable project, tool, and rule knowledge | `rule:file-safety → ask before overwrite` |
+| **Profile** | Identity, preferences, and environment | `communication_style → concise` |
+| **Factual** | Entities, relations, and time-aware facts | `alice works_at acme [2023 → now]` |
+| **Episodic** | Session transcripts and summaries | `May 15 → discussed roadmap` |
+| **Procedural** | Skills, triggers, and workflows | `code-review → security, performance, style` |
 
+### Highlights
+
+- One SQLite database for all memory layers
+- Unified cross-layer query with CLARK-style score fusion
+- Knowledge graph traversal, entity resolution, and path finding
+- BM25 full-text search plus vector similarity through `sqlite-vec`
+- Bi-temporal facts, confidence propagation, conflict invalidation, and utility-based forgetting
+- Local deterministic embeddings by default; Gemini embeddings are optional
+- Optional DeepSeek-powered extraction, reranking, and summarization
+- GDPR-oriented deletion workflow with an audit trail
+- CLI and Python API
+
+## Architecture
+
+```text
+                         query("what does Alice prefer?")
+                                      │
+             ┌────────────┬───────────┼───────────┬────────────┐
+             ▼            ▼           ▼           ▼            ▼
+         Semantic      Profile     Factual     Episodic    Procedural
+        tools/rules   preferences    graph      sessions      skills
+             └────────────┴───────────┼───────────┴────────────┘
+                                      ▼
+                   CLARK fusion · ranking · top-N results
+                                      │
+                                      ▼
+                            one SQLite database
 ```
-┌─────────────────────────────────────────────────────┐
-│                 unified query("...")                │
-│          CLARK fusion across all layers             │
-└──────────┬──────────┬──────────┬───────────────────┘
-           │          │          │
-     ┌─────▼──┐ ┌─────▼──┐ ┌─────▼─────┐ ┌──────────▼──┐
-     │PROFILE │ │FACTUAL │ │ EPISODIC  │ │ PROCEDURAL   │
-     │        │ │        │ │           │ │              │
-     │Who am  │ │What do │ │What did   │ │How do I     │
-     │I? What │ │I know? │ │we discuss │ │do X?        │
-     │do I    │ │Entities │ │in past    │ │Skills +     │
-     │like?   │ │+ facts  │ │sessions?  │ │workflows    │
-     │        │ │+ graph  │ │           │ │              │
-     └────────┘ └────────┘ └───────────┘ └──────────────┘
-```
 
-### Five Layers, One SQLite Database
+The factual layer uses CLARK retrieval in three stages:
 
-| Layer | Table | Purpose | Example |
-|-------|-------|---------|---------|
-| **Semantic** | `memory_semantic` | Stable project/tool/rule knowledge | `rule:file-safety -> never overwrite user-owned files without explicit approval` |
-| **Profile** | `memory_profile` | Identity, preferences, environment | `communication_style: warm but fast` |
-| **Factual** | `facts` + `entities` + `relations` | Knowledge graph with temporal validity | `alice works_at acme [2023→now]` |
-| **Episodic** | `memory_sessions` | Session transcripts + auto-summaries | `May 15: discussed memory architecture` |
-| **Procedural** | `memory_skills` | Skills with trigger conditions | `response-formatting: triggered by "format"` |
+1. **Value Iteration** propagates confidence through the graph.
+2. **A\* Search** selects relevant entities using graph importance, semantic similarity, and temporal signals.
+3. **Confidence Update** reinforces retrieved facts and their neighbors.
 
----
+## Quick start
 
-## Why JKG 7.0
-
-Most AI memory systems keep components in separate databases. Graph in Neo4j. Vectors in pgvector. Sessions in another store. **State drift is inevitable** — the graph says one thing, embeddings say another.
-
-JKG 7.0 runs **everything in one SQLite transaction**: graph, embeddings, temporal validity, emotional context, intentional forgetting, self-evolving schema, profile preferences, session transcripts, and skill indexes. **No drift. No orphans. No external APIs for recall.**
-
-| Feature | Mem0 | Cognee | Zep | Letta | **JKG 7.0** |
-|---------|:----:|:------:|:---:|:-----:|:-----------:|
-| Four memory layers | ❌ 2 | ❌ 2 | ❌ 3 | ❌ 2 | ✅ |
-| Unified cross-layer query | ❌ | ❌ | ❌ | ❌ | ✅ CLARK |
-| Graph + Embeddings, one DB | — | — | — | — | ✅ |
-| Dynamic session context injection | ❌ | ❌ | ❌ | ⚠️ | ✅ |
-| Auto-sync bridges | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Bi-temporal validity (T+T') | — | — | ✅ | — | ✅ |
-| Emotional context | — | — | — | — | ✅ |
-| Intentional forgetting (utility) | — | — | — | — | ✅ |
-| Self-evolving schema | — | — | — | — | ✅ |
-| GDPR true deletion + audit trail | — | — | — | — | ✅ |
-| CLARK retrieval (Value Iteration + A*) | — | — | — | — | ✅ |
-| Fully local (no cloud for recall) | — | — | — | — | ✅ |
-
----
-
-## Quick Start
+### 1. Install
 
 ```bash
 git clone https://github.com/altyshalu/jessica-knowledge-graph.git
 cd jessica-knowledge-graph
-pip install -e .
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 
-### Embeddings setup
-
-```bash
-# Optional but recommended for semantic retrieval quality
-export GEMINI_API_KEY=your_key_here
-```
-
-If `GEMINI_API_KEY` is not set, JKG still runs. It falls back to deterministic local hash embeddings, so semantic retrieval still works without cloud calls, just with lower quality than Gemini.
-
-### Your First Memory
-
-```bash
-# Remember a fact (factual layer)
-python3 -m jkg.memory remember "Alice is a software engineer at Acme Corp since 2023"
-
-# Remember a user preference (profile layer)
-python3 -m jkg.memory remember-profile "Alice prefers concise, no-fluff answers"
-
-# Remember stable project / tool / rule knowledge (semantic layer)
-python3 -m jkg.memory remember-project "A Zone automates startup supply-side operations before scoring" "a-zone"
-python3 -m jkg.memory remember-tool "Hermes is the runtime behind Jessica" "Hermes"
-python3 -m jkg.memory remember-rule "Never overwrite user-owned files without approval" "file-safety"
-
-# Index a session transcript (episodic layer)
-python3 -m jkg.memory remember-session "session-001" "Discussed Q3 roadmap and memory architecture"
-
-# Index a skill (procedural layer)
-python3 -m jkg.memory index-skill "code-review" "Reviews PRs for security, performance, and style"
-
-# Query across ALL layers at once
-python3 -m jkg.memory query "what does Alice prefer?"
-
-# Get dynamic session-start context (replaces flat prompt injection)
-python3 -m jkg.memory session-start
-```
-
-### Python API
+### 2. Store and query memory
 
 ```python
 from jkg import HybridMemory
 
-hm = HybridMemory()
+memory = HybridMemory(db_path="./data/jkg.sqlite3")
 
-# ── Ingest ──────────────────────────────
-hm.remember("Alice works at Acme")                # factual
-hm.remember_profile("Alice prefers fast replies")  # profile
-hm.remember_project("A Zone prepares startups before investor matching", project="a-zone")
-hm.remember_tool("Hermes is Jessica's runtime", tool_name="Hermes")
-hm.remember_rule("Never overwrite user-owned files without approval", rule_name="file-safety")
-hm.remember_session("sess-001", "transcript...")  # episodic
-hm.index_skill("my-skill", description="...", triggers=["when ..."])  # procedural
+memory.remember("Alice works at Acme since 2023")
+memory.remember_profile("Alice prefers concise answers")
+memory.remember_project(
+    "The product uses one SQLite database for all memory layers.",
+    project="jkg",
+)
+memory.remember_rule(
+    "Never overwrite user-owned files without approval.",
+    rule_name="file-safety",
+)
 
-# ── Unified Query ───────────────────────
-# One call, all layers, CLARK-ranked
-result = hm.query("how does Alice communicate?")
-for r in result["results"]:
-    print(f"[{r['layer']}] score={r['score']:.2f} — {r}")
-# [profile]  score=0.92 — key: communication_style, value: fast
-# [factual]  score=0.87 — alice prefers быстрые ответы
-# [episodic] score=0.72 — Session May 12: "don't call me bestie"
-
-# ── Session Context ─────────────────────
-context = hm.session_start_context()
-# DYNAMIC CONTEXT (JKG 7.0)
-# [Profile] communication_style: fast...
-# [Active Facts] alice works_at acme...
-# [Recent Episodes] 🎯 May 15: discussed architecture...
-# [Relevant Skills] code-review, response-formatting...
+result = memory.query("How does Alice prefer to communicate?")
+for item in result["results"]:
+    print(item["layer"], item.get("score"), item)
 ```
 
----
+### 3. Use the CLI
 
-## Architecture
+The package installs the `jkg` command. `python -m jkg.memory` works as an equivalent entry point.
 
-### CLARK Retrieval (bio-inspired)
-
-Inspired by the **Clark's Nutcracker** (*Nucifraga columbiana*) — a bird with the best long-term spatial memory in the animal kingdom (30,000+ seed caches, 9+ month retrieval window).
-
-**Three stages:**
-
-1. **Value Iteration** — elastic adaptation (like seasonal hippocampus growth): propagates confidence through the graph
-2. **A\* Search** — retrieval (like landmark-based navigation): selects top entities by PageRank × confidence, scores with cosine similarity + temporal bonus
-3. **Confidence Update** — self-learning (like neurogenesis): retrieved facts get +0.05 confidence boost, neighbors get +0.017
-
-```
-Value Iteration     A* Search          Confidence Update
-   ┌───┐           ┌──────┐           ┌──────┐
-   │ V │ ────────→ │  A*  │ ────────→ │  +Δ  │
-   └───┘   graph   └──────┘  retrieve └──────┘  learn
-  propagate         landmarks           boost
+```bash
+jkg remember "Alice is a software engineer at Acme since 2023"
+jkg remember-profile "Alice prefers concise answers"
+jkg remember-project jkg "JKG stores all memory layers in SQLite"
+jkg remember-rule file-safety "Never overwrite user files without approval"
+jkg query "What does Alice prefer?"
+jkg stats
 ```
 
-### Multi-Layer Query Flow
+## Configuration
 
-```
-unified_query("how does Alice communicate?")
-  │
-  ├─► Semantic Layer: stable project/tool/rule retrieval
-  │    → "Hermes is the runtime behind Jessica" (score=0.96)
-  │
-  ├─► Profile Layer:  key/value LIKE search + embedding fallback
-  │    → "communication_style: fast" (score=0.92)
-  │
-  ├─► Factual Layer:  CLARK (Value Iteration → A* → Confidence Update)
-  │    → "alice prefers быстрые ответы" (score=0.87)
-  │
-  ├─► Episodic Layer: full_text LIKE search
-  │    → "Session May 12: don't call me bestie" (score=0.72)
-  │
-  └─► Procedural Layer: name/description/triggers LIKE search
-       → "response-formatting: no tables, emoji..." (score=0.65)
-  │
-  ▼
-CLARK-style fusion: sort by score, return top-N across layers
+JKG works without API keys. When no embedding provider is configured, it uses deterministic local hash embeddings.
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `JKG_DB_PATH` | SQLite database location | `jkg/memory_v3.db` |
+| `GEMINI_API_KEY` | Enables Gemini embeddings | unset |
+| `DEEPSEEK_API_KEY` | Enables remote extraction and synthesis | unset |
+| `JKG_ENV_PATH` | Path to a custom `.env` file | auto-discovery |
+| `JKG_LLM_TIMEOUT_SECONDS` | LLM request timeout | `20` |
+| `JKG_EMBEDDING_TIMEOUT_SECONDS` | Embedding request timeout | `8` |
+| `JKG_SQLITE_BUSY_TIMEOUT_MS` | SQLite lock wait time | `15000` |
+
+Example `.env`:
+
+```dotenv
+JKG_DB_PATH=./data/jkg.sqlite3
+GEMINI_API_KEY=
+DEEPSEEK_API_KEY=
 ```
 
-### Database Schema (21 tables, 1 file)
+Never commit real API keys. `.env` and database files are ignored by Git.
 
-```
-memory_v3.db
-├── SEMANTIC       memory_semantic    (kind, scope, subject, canonical_key, statement)
-├── PROFILE        memory_profile     (key, value, category, confidence)
-├── FACTUAL        entities           (id, name, type, summary)
-│                  facts              (subject, predicate, object, temporal, confidence, utility)
-│                  relations          (subject → predicate → object)
-│                  episodes           (uuid, body, emotion)
-│                  facts_fts          (BM25 keyword search)
-│                  facts_vec          (sqlite-vec KNN search)
-├── EPISODIC       memory_sessions    (session_id, full_text, summary, emotion, importance)
-├── PROCEDURAL     memory_skills      (name, description, triggers, version)
-├── EVOLUTION      schema_evolution   (pattern proposals)
-│                  forget_log         (utility-based pruning trail)
-│                  deletion_log       (GDPR audit trail)
+## Memory APIs
+
+```python
+# Semantic
+memory.remember_project("...", project="my-project")
+memory.remember_tool("...", tool_name="my-tool")
+memory.remember_rule("...", rule_name="my-rule")
+
+# Profile, factual, episodic, procedural
+memory.remember_profile("...")
+memory.remember("...")
+memory.remember_session("session-001", "...")
+memory.index_skill("code-review", description="...", triggers=["review PR"])
+
+# Unified retrieval
+memory.query("...", layers=["semantic", "profile", "factual"])
+memory.session_start_context()
 ```
 
----
+More detail about durable project, tool, and rule memory is available in [Semantic Memory](docs/SEMANTIC_MEMORY.md).
+
+## CLI reference
+
+| Area | Commands |
+|---|---|
+| Ingest | `remember`, `remember-profile`, `remember-project`, `remember-tool`, `remember-rule`, `remember-session`, `index-skill` |
+| Query | `query`, `recall`, `ask`, `clark`, `semantic`, `profile`, `sessions` |
+| Graph | `entities`, `traverse`, `path`, `resolve`, `bridge` |
+| Maintenance | `stats`, `propagate`, `utility`, `prune`, `forget`, `evolve`, `gdpr-delete` |
+| Context | `session-start`, `episodes`, `emotions`, `migrate-memory` |
+
+Run `jkg` without arguments to print database statistics. An unknown command prints the available command list.
 
 ## Benchmarks
 
-**LongMemEval-S** — industry standard for agent memory retrieval ([arXiv:2410.10813](https://arxiv.org/abs/2410.10813))
+The preliminary LongMemEval-S run reports **96.8% Recall@5** on 100 of 500 questions and **100% Recall@10** for that sample. The benchmark runner and methodology are available in [`benchmark/run_longmemeval.py`](benchmark/run_longmemeval.py).
 
-| System | Recall@5 | Recall@10 | Notes |
-|--------|:--------:|:---------:|-------|
-| **JKG 7.0** | **96.8%** | **100%** | CLARK A* retrieval |
-| MemPalace | 96.6% | — | Graph + LLM rerank |
-| agentmemory | 95.2% | — | Baseline |
+These results are preliminary and are not a substitute for a full, independently reproduced benchmark. Workload, embedding backend, hardware, and dataset size can materially change results.
 
-*Preliminary on 100/500 questions. Full 500-question run requires GPU (~30 min on CPU). Results saved to `benchmark/longmemeval_jkg_results.json`.*
+## Production notes
 
----
+- Set `JKG_DB_PATH` to a persistent application data directory; do not keep production data inside the installed package.
+- Back up the SQLite database and test restore procedures before relying on it for durable state.
+- Keep `.env` and API keys outside version control and rotate any key that may have been exposed.
+- Use one embedding dimension per database. Switching between local 384-dimensional and Gemini 768-dimensional embeddings requires a fresh database or a migration.
+- SQLite is a strong fit for a single service instance. Evaluate a server database or explicit coordination before using one database file across multiple hosts.
+- Run privacy-deletion tests against your own ingestion paths before making regulatory guarantees.
 
-## Comparison with Industry (May 2026)
+## Project status
 
-| System | 4 Layers | Unified Query | Dynamic Injection | Sync Bridges | Graph+Emb 1DB | Temporal | Emotional | Forgetting | Self-Evolve | Privacy | $/mo |
-|---------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **JKG 7.0** | ✅ | ✅ CLARK | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | $0 |
-| Graphiti/Zep | ❌ 3 | ❌ | ❌ | ❌ | ❌ Neo4j+PG | ✅ | ❌ | ❌ | ❌ | ❌ | $$ |
-| Cognee | ❌ 2 | ❌ | ❌ | ❌ | ❌ 3 DBs | ❌ | ❌ | ❌ | ❌ | ❌ | $$ |
-| Mem0 | ❌ 2 | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | $$ |
-| Letta/MemGPT | ❌ 2 | ❌ | ⚠️ | ❌ | ✅ | ⚠️ | ❌ | ❌ | ❌ | ❌ | $ |
+JKG 7.1 is **beta software**. The core package and semantic-memory tests are covered by CI, but several advanced behaviors still need broader stress testing. See [Architecture Audit & Fix Checklist](docs/BUG_REPORT_AND_FIXES.md) for the current engineering notes.
 
----
-
-## Commands Reference
+## Development
 
 ```bash
-# ═══ INGEST ═══
-python3 -m jkg.memory remember "text"              # factual layer
-python3 -m jkg.memory remember-profile "pref"       # profile layer
-python3 -m jkg.memory remember-session "id"         # episodic layer
-python3 -m jkg.memory index-skill "name" "desc"     # procedural layer
-
-# ═══ QUERY ═══
-python3 -m jkg.memory query "question?"             # ALL layers
-python3 -m jkg.memory query "q?" --layers profile,factual
-python3 -m jkg.memory clark "query"                 # factual-only CLARK
-python3 -m jkg.memory ask "question?"               # factual Q&A with LLM synthesis
-python3 -m jkg.memory recall "query"                # RRF hybrid (factual)
-
-# ═══ SESSION ═══
-python3 -m jkg.memory session-start                 # dynamic context injection
-python3 -m jkg.memory profile                       # view profile facts
-python3 -m jkg.memory sessions "keyword"            # search sessions
-
-# ═══ MAINTENANCE ═══
-python3 -m jkg.memory stats                         # full statistics
-python3 -m jkg.memory propagate                     # Value Iteration (CLARK stage 1)
-python3 -m jkg.memory utility                       # recalculate memory utility scores
-python3 -m jkg.memory prune 0.15                    # forget low-utility facts (dry-run)
-python3 -m jkg.memory prune 0.15 --execute          # actually forget
-python3 -m jkg.memory evolve                        # propose new entity/relation types
-python3 -m jkg.memory gdpr-delete "name" --confirm  # full GDPR deletion
-
-# ═══ GRAPH TRAVERSAL ═══
-python3 -m jkg.memory traverse "alice" 3            # BFS from entity, depth 3
-python3 -m jkg.memory path "alice" "acme"           # find path between entities
-python3 -m jkg.memory resolve "alic"                # fuzzy entity resolution
-python3 -m jkg.memory bridge both                   # graph↔embeddings bridge
-python3 -m jkg.memory emotions                      # emotional context summary
+python -m pip install -e .
+python -m unittest discover -v
+python -m compileall -q jkg examples
 ```
 
----
-
-## Installation
-
-```bash
-# Clone
-git clone https://github.com/altyshalu/jessica-knowledge-graph.git
-cd jessica-knowledge-graph
-
-# Install
-pip install -e .
-
-# Dependencies
-pip install sentence-transformers scipy numpy requests sqlite-vec
-```
-
-**Requirements:** Python 3.10+, SQLite 3.40+, [sqlite-vec](https://github.com/asg017/sqlite-vec)
-
-LLM extraction uses DeepSeek API by default (set `DEEPSEEK_API_KEY` in `.env`). Pluggable — any OpenAI-compatible endpoint works.
-
----
-
-## Papers & Inspiration
-
-- [Clark's Nutcracker spatial memory](https://en.wikipedia.org/wiki/Clark%27s_nutcracker) — bio-inspiration for CLARK retrieval
-- [Zep/Graphiti: Temporal Knowledge Graphs for Agentic Apps](https://arxiv.org/abs/2501.13956) — bi-temporal model
-- [LongMemEval: Benchmarking Long-Context LLMs on Memory Tasks](https://arxiv.org/abs/2410.10813) — eval framework
-- [MemGPT: Towards LLMs as Operating Systems](https://arxiv.org/abs/2310.08560) — agent memory architecture
-- [Cognee: Scalable GraphRAG for AI Agents](https://www.cognee.ai/) — multi-database graph memory
-
----
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Please report security issues through the process in [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT © Altynai
+Released under the [MIT License](LICENSE). Copyright © 2026 Altynai.
 
----
+<div align="center">
 
-<p align="center">
-  <i>One database. Four layers. Zero drift.</i>
-</p>
+**One database. Five memory layers. Zero drift.**
+
+</div>

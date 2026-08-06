@@ -4,7 +4,7 @@
 This branch is intended for release preparation of the `fix/architecture-flaws` work already present in the repository.
 
 Included in this final cleanup:
-- packaging metadata alignment to JKG 7.0
+- packaging metadata alignment to JKG 7.1
 - README clarification for optional Gemini embeddings setup
 - local artifact ignore rules for verification outputs
 - quickstart copy cleanup to match current package version

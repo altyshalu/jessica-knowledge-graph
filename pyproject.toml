@@ -27,6 +27,12 @@ dependencies = [
     "numpy>=1.24",
 ]
 
+[project.urls]
+Homepage = "https://github.com/altyshalu/jessica-knowledge-graph"
+Documentation = "https://github.com/altyshalu/jessica-knowledge-graph#readme"
+Issues = "https://github.com/altyshalu/jessica-knowledge-graph/issues"
+Source = "https://github.com/altyshalu/jessica-knowledge-graph"
+
 [project.scripts]
 jkg = "jkg.memory:main_cli"
 

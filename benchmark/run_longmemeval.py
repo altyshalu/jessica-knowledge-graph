@@ -241,7 +241,7 @@ print(f"  Zep/Graphiti QA:            71.2% (full QA, разные метрик�
 # Save detailed results
 output = {
     "benchmark": "LongMemEval-S",
-    "system": "JKG 5.1",
+    "system": "JKG 7.1",
     "architecture": "BM25(FTS5) + Vector(MiniLM-L6-v2) + RRF(k=60)",
     "questions": total,
     "skipped_abstention": results["skipped_abstention"],
