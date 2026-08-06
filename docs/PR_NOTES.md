@@ -1,8 +1,9 @@
-# Release Notes — JKG 8.0
+# Release Notes — JKG 8.1
 
-JKG 8.0 focuses on memory correctness and production boundaries.
+JKG 8.1 adds the complete CLARK graph-recovery algorithm on top of the JKG 8 memory correctness and production boundaries.
 
 - query-dependent cross-layer ranking with preserved vector KNN order
+- multi-source A* with optimal maximum-reliability graph paths and inspectable traces
 - physically isolated namespaces
 - embedding provider/model/dimension registry with explicit full reindexing
 - persisted vector indexes for semantic, profile, factual, episodic, and procedural memory
@@ -11,7 +12,7 @@ JKG 8.0 focuses on memory correctness and production boundaries.
 - bounded session-start context
 - corrected semantic-noise and retrieval-stability evaluation scenarios
 
-Verified locally with 10 unit/invariant tests, 8 extended scenarios, compilation,
+Verified locally with 11 unit/invariant tests, 8 extended scenarios, compilation,
 package build, and metadata validation.
 
 Known limits: the package remains beta; multi-process write load, large migrations,

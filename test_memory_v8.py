@@ -71,6 +71,25 @@ class MemoryV8Tests(unittest.TestCase):
         self.assertLessEqual(len(memory.session_start_context(owner="alice", max_chars=1000)), 1200)
         memory.conn.close()
 
+    def test_clark_astar_returns_most_reliable_optimal_path(self):
+        memory = HybridMemory(self.path)
+        a = memory._ensure_entity("alpha")
+        b = memory._ensure_entity("beta")
+        goal = memory._ensure_entity("goal")
+        memory.conn.executemany(
+            "INSERT INTO relations(subject_id,predicate,object_id,confidence) VALUES(?,?,?,?)",
+            [
+                (a, "direct", goal, 0.5),
+                (a, "via", b, 0.9),
+                (b, "via", goal, 0.9),
+            ],
+        )
+        memory.conn.commit()
+        paths = memory._clark_astar_entities({a: 0.0}, max_nodes=10, max_depth=3)
+        self.assertEqual(paths[goal]["path"], ["alpha", "beta", "goal"])
+        self.assertAlmostEqual(paths[goal]["path_reliability"], 0.81, places=6)
+        memory.conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

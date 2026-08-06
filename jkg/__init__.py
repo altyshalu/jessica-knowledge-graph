@@ -3,7 +3,7 @@ from .config import EmbeddingConfigurationError, MemoryConfig
 from .lifecycle import ContextBudget, FeedbackSignal, MemoryAction
 from .memory import HybridMemory
 
-__version__ = "8.0.0"
+__version__ = "8.1.0"
 __all__ = [
     "HybridMemory", "MemoryConfig", "EmbeddingConfigurationError",
     "ContextBudget", "FeedbackSignal", "MemoryAction",

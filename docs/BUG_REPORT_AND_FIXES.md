@@ -1,7 +1,7 @@
-# JKG 8.0 — Architecture Audit and Remaining Work
+# JKG 8.1 — Architecture Audit and Remaining Work
 
 ## Current Situation
-JKG 8 keeps five memory layers in an isolated SQLite database per namespace. The current automated evaluation passes all 8 edge-case scenarios plus 9 unit/invariant tests.
+JKG 8.1 keeps five memory layers in an isolated SQLite database per namespace and uses CLARK multi-source A* for reliable graph recovery. The current automated evaluation passes all 8 edge-case scenarios plus 11 unit/invariant tests.
 
 ## Bug Checklist & Remediation Plan
 

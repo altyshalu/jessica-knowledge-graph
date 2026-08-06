@@ -2119,13 +2119,82 @@ JSON:"""
         scored.sort(key=lambda x: -x["score"])
         return scored[:limit]
 
-    def retrieve_clark(self, query: str, top_k: int = 10, beam_width: int = 5) -> list:
-        """Query-seeded best-first retrieval over vector, text, and graph candidates.
+    def _clark_astar_entities(self, seed_costs: dict, max_nodes: int = 50,
+                              max_depth: int = 3) -> dict:
+        """Run multi-source A* from a virtual query node over entity relations.
 
-        CLARK is kept as the public API name, but the implementation deliberately
-        avoids claiming A* optimality. Candidate facts are seeded by KNN and BM25,
-        expanded over nearby graph entities, and scored on a calibrated 0..1 scale.
+        Query-to-seed and relation costs are non-negative negative-log
+        probabilities. The heuristic is zero, which is admissible and consistent;
+        therefore every entity popped from the queue has its optimal path cost.
+        This is A* in its uniform-cost special case and favors reliable paths over
+        merely short ones.
         """
+        if not seed_costs:
+            return {}
+
+        frontier = []
+        best_cost = {}
+        best_depth = {}
+        parent = {}
+        for entity_id, initial_cost in seed_costs.items():
+            cost = max(0.0, float(initial_cost))
+            if cost < best_cost.get(entity_id, float("inf")):
+                best_cost[entity_id] = cost
+                best_depth[entity_id] = 0
+                parent[entity_id] = None
+                heapq.heappush(frontier, (cost, cost, 0, entity_id))
+
+        settled = {}
+        while frontier and len(settled) < max_nodes:
+            _f_score, g_score, depth, entity_id = heapq.heappop(frontier)
+            if entity_id in settled or g_score > best_cost.get(entity_id, float("inf")) + 1e-12:
+                continue
+            settled[entity_id] = g_score
+            if depth >= max_depth:
+                continue
+
+            rows = self.conn.execute("""
+                SELECT subject_id, object_id, confidence
+                FROM relations WHERE subject_id=? OR object_id=?
+            """, (entity_id, entity_id)).fetchall()
+            for row in rows:
+                neighbor = row["object_id"] if row["subject_id"] == entity_id else row["subject_id"]
+                reliability = max(1e-6, min(1.0, float(row["confidence"] or 0.5)))
+                tentative = g_score - math.log(reliability)
+                next_depth = depth + 1
+                if tentative + 1e-12 >= best_cost.get(neighbor, float("inf")):
+                    continue
+                best_cost[neighbor] = tentative
+                best_depth[neighbor] = next_depth
+                parent[neighbor] = entity_id
+                heuristic = 0.0
+                heapq.heappush(frontier, (tentative + heuristic, tentative, next_depth, neighbor))
+
+        names = {
+            row["id"]: row["name"] for row in self.conn.execute(
+                f"SELECT id, name FROM entities WHERE id IN ({','.join('?' for _ in settled)})",
+                tuple(settled),
+            ).fetchall()
+        } if settled else {}
+        result = {}
+        for entity_id, cost in settled.items():
+            path_ids = []
+            cursor = entity_id
+            while cursor is not None:
+                path_ids.append(cursor)
+                cursor = parent.get(cursor)
+            path_ids.reverse()
+            result[entity_id] = {
+                "cost": cost,
+                "depth": best_depth.get(entity_id, 0),
+                "path_ids": path_ids,
+                "path": [names.get(node_id, node_id) for node_id in path_ids],
+                "path_reliability": math.exp(-cost),
+            }
+        return result
+
+    def retrieve_clark(self, query: str, top_k: int = 10, beam_width: int = 5) -> list:
+        """CLARK retrieval: landmarks, optimal A* graph paths, and fact ranking."""
         if not self.has_vec:
             return self.recall(query, limit=top_k)
 
@@ -2136,6 +2205,7 @@ JSON:"""
         candidate_limit = max(top_k * 8, 50)
         vector_scores = {}
         seed_fact_ids = set()
+        seed_relevance = {}
 
         try:
             rows = self.conn.execute(
@@ -2147,6 +2217,7 @@ JSON:"""
                 distance = max(0.0, float(row["distance"]))
                 vector_scores[row["fact_id"]] = 1.0 / (1.0 + distance)
                 seed_fact_ids.add(row["fact_id"])
+                seed_relevance[row["fact_id"]] = vector_scores[row["fact_id"]]
         except Exception:
             pass
 
@@ -2155,7 +2226,11 @@ JSON:"""
                 "SELECT rowid AS fact_id FROM facts_fts WHERE facts_fts MATCH ? LIMIT ?",
                 (self._fts_query(query), candidate_limit),
             ).fetchall()
-            seed_fact_ids.update(row["fact_id"] for row in rows)
+            for rank, row in enumerate(rows):
+                seed_fact_ids.add(row["fact_id"])
+                seed_relevance[row["fact_id"]] = max(
+                    seed_relevance.get(row["fact_id"], 0.0), 1.0 / (rank + 1)
+                )
         except Exception:
             pass
 
@@ -2164,34 +2239,19 @@ JSON:"""
 
         placeholders = ",".join("?" for _ in seed_fact_ids)
         seed_entities = self.conn.execute(
-            f"SELECT DISTINCT subject_id FROM facts WHERE id IN ({placeholders})",
+            f"SELECT id, subject_id FROM facts WHERE id IN ({placeholders})",
             tuple(seed_fact_ids),
         ).fetchall()
-
-        entity_depth = {}
-        frontier = []
+        seed_costs = {}
         for row in seed_entities:
-            entity_depth[row["subject_id"]] = 0
-            heapq.heappush(frontier, (0, row["subject_id"]))
+            relevance = max(1e-6, min(1.0, seed_relevance.get(row["id"], 0.5)))
+            cost = -math.log(relevance)
+            seed_costs[row["subject_id"]] = min(seed_costs.get(row["subject_id"], float("inf")), cost)
 
-        max_entities = max(25, beam_width * 10)
-        while frontier and len(entity_depth) < max_entities:
-            depth, entity_id = heapq.heappop(frontier)
-            if depth >= 2:
-                continue
-            neighbors = self.conn.execute(
-                "SELECT CASE WHEN subject_id=? THEN object_id ELSE subject_id END AS neighbor "
-                "FROM relations WHERE subject_id=? OR object_id=? LIMIT ?",
-                (entity_id, entity_id, entity_id, max(beam_width, 1)),
-            ).fetchall()
-            for neighbor in neighbors:
-                neighbor_id = neighbor["neighbor"]
-                if neighbor_id in entity_depth:
-                    continue
-                entity_depth[neighbor_id] = depth + 1
-                heapq.heappush(frontier, (depth + 1, neighbor_id))
-
-        entity_ids = list(entity_depth)
+        astar = self._clark_astar_entities(
+            seed_costs, max_nodes=max(25, beam_width * 10), max_depth=3
+        )
+        entity_ids = list(astar)
         entity_placeholders = ",".join("?" for _ in entity_ids)
         active_clause = "" if include_historical else "AND f.forget_status='active'"
         facts = self.conn.execute(
@@ -2251,7 +2311,8 @@ JSON:"""
                     fact["valid_from"], fact["valid_until"], timeframe
                 ) else 0.0
 
-            graph_proximity = 1.0 / (1.0 + entity_depth.get(fact["subject_id"], 2))
+            path_info = astar.get(fact["subject_id"], {})
+            graph_proximity = float(path_info.get("path_reliability", 0.0))
             similarity = max(0.0, min(1.0, vector_scores.get(fact["id"], 0.0)))
             confidence = max(0.0, min(1.0, float(fact["confidence"] or 0.5)))
             score = (
@@ -2271,7 +2332,9 @@ JSON:"""
                 "cosine_sim": round(similarity, 4),
                 "lexical_score": round(lexical, 4),
                 "temporal_bonus": round(temporal, 4),
-                "graph_depth": entity_depth.get(fact["subject_id"], 2),
+                "graph_depth": path_info.get("depth", 0),
+                "graph_path": path_info.get("path", [fact["entity_name"]]),
+                "astar_cost": round(float(path_info.get("cost", 0.0)), 6),
             })
 
         ranked.sort(key=lambda item: item["clark_score"], reverse=True)
@@ -2746,7 +2809,7 @@ JSON:"""
             "vectors": vectors, "has_embeddings": self.has_vec,
             "schema_proposals": schema_proposals,
             "avg_utility": round(avg_util, 3) if avg_util else None,
-            "version": "8.0.0",
+            "version": "8.1.0",
             "namespace": self.namespace,
             "embedding_signature": self.config.embedding_signature,
             "architecture": "five-layer+graph+full-text+vectors+temporal+lifecycle",

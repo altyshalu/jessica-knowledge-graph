@@ -5,7 +5,7 @@
 ### One local database for semantic, profile, factual, episodic, and procedural memory
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-8.0.0-7C3AED)](https://github.com/altyshalu/jessica-knowledge-graph)
+[![Version](https://img.shields.io/badge/version-8.1.0-7C3AED)](https://github.com/altyshalu/jessica-knowledge-graph)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22C55E)](LICENSE)
 [![Status: Beta](https://img.shields.io/badge/status-beta-F59E0B)](#project-status)
 
@@ -60,13 +60,16 @@ Memory-heavy applications often split preferences, facts, transcripts, rules, an
                             one SQLite database
 ```
 
-The factual layer uses a CLARK-inspired hybrid retrieval pipeline:
+The factual layer uses **CLARK — Confidence-Layered A\* Retrieval for Knowledge**, JKG's graph-memory retrieval algorithm:
 
-1. **Value Iteration** propagates confidence through the graph.
-2. **Best-first retrieval** seeds candidates with vector and BM25 results, then expands graph neighbors.
-3. **Calibrated ranking** combines semantic, lexical, temporal, evidence-confidence, and graph-distance signals.
+1. **Landmark selection** uses vector KNN and BM25 to connect a virtual query node to relevant entity seeds.
+2. **A\* graph recovery** searches entity relations with `−log(relevance)` query costs and `−log(confidence)` edge costs. Its zero heuristic is admissible and consistent, so every settled entity has an optimal maximum-reliability path.
+3. **Calibrated ranking** combines semantic, lexical, temporal, evidence-confidence, and optimal-path reliability signals.
 
 Retrieval never increases truth confidence. Reads update a separate salience score and access log.
+Each result exposes `graph_path`, `graph_depth`, and `astar_cost` for inspection.
+
+The name is inspired by research showing that Clark's nutcrackers recover caches using landmarks and geometric relationships; CLARK itself is a JKG algorithm, not the name of an algorithm from those studies. See [Kamil & Jones (1997)](https://doi.org/10.1038/36840) and [Gibson & Kamil (2001)](https://doi.org/10.1037/0735-7036.115.4.403).
 
 ## Quick start
 
@@ -199,7 +202,7 @@ These results are preliminary and are not a substitute for a full, independently
 
 ## Project status
 
-JKG 8.0 is **beta software**. Correctness, namespace isolation, lifecycle, and vector-index invariants are tested locally, but broader load, migration, and retrieval-quality testing is still required.
+JKG 8.1 is **beta software**. Correctness, namespace isolation, lifecycle, vector-index, and optimal-path invariants are tested locally, but broader load, migration, and retrieval-quality testing is still required.
 
 ## Development
 
