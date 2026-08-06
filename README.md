@@ -314,7 +314,7 @@ LLM extraction uses DeepSeek API by default (set `DEEPSEEK_API_KEY` in `.env`). 
 
 ## License
 
-MIT © Jessica (Altynai's AI assistant)
+MIT © Altynai
 
 ---
 
