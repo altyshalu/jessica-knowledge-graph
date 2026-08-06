@@ -63,6 +63,8 @@ SEMANTIC_EMBED_LIMIT = int(os.environ.get("JKG_SEMANTIC_EMBED_LIMIT", "12"))
 def _llm(prompt: str, system: str = "You are a precise knowledge extraction engine.") -> str:
     if requests is None:
         raise RuntimeError("requests is not installed; remote LLM extraction is unavailable")
+    if not API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY is not configured")
     r = requests.post(
         f"{API_BASE}/v1/chat/completions",
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
@@ -478,7 +480,7 @@ class HybridMemory:
                 object_text TEXT
             );
 
-            -- JKG 7.0: UNIFIED MEMORY FABRIC — multi-layer memory
+            -- JKG 7.1: UNIFIED MEMORY FABRIC — multi-layer memory
             -- PROFILE Layer: user identity, preferences, environment facts
             CREATE TABLE IF NOT EXISTS memory_profile (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -840,7 +842,7 @@ JSON:"""
         return len(conflict_ids)
 
     # ═══════════════════════════════════════════════
-    # JKG 5.1: TEMPORAL LINKING — connect temporal facts to their targets
+    # JKG 7.1: TEMPORAL LINKING — connect temporal facts to their targets
     # ═══════════════════════════════════════════════
 
     # Predicate groups: when one predicate in a group appears, it should
@@ -1247,7 +1249,7 @@ JSON:"""
 
     def gdpr_delete(self, entity_name: str, request_id: str = None, 
                      verified: bool = False) -> dict:
-        """Full deletion: graph + vectors + episodes. GDPR-compliant audit trail."""
+        """Delete matching data across every memory layer and retain an audit record."""
         if not verified:
             return {"status": "requires_verification",
                     "instruction": "Set verified=True after human confirmation"}
@@ -1256,20 +1258,22 @@ JSON:"""
         if not eid:
             return {"status": "not_found", "entity": entity_name}
 
-        # Delete vectors
-        if self.has_vec:
-            fact_ids = self.conn.execute(
-                "SELECT id FROM facts WHERE subject_id=?", (eid,)).fetchall()
-            for f in fact_ids:
+        pattern = f"%{entity_name.strip()}%"
+        facts = self.conn.execute(
+            "SELECT id, subject_id, predicate, object_text FROM facts "
+            "WHERE subject_id=? OR object_text LIKE ?",
+            (eid, pattern),
+        ).fetchall()
+        fact_ids = [fact["id"] for fact in facts]
+
+        # Remove vector rows and external FTS content for affected facts.
+        for fact in facts:
+            if self.has_vec:
                 try:
-                    self.conn.execute("DELETE FROM facts_vec WHERE fact_id=?", (f["id"],))
-                except: pass
-                
-                # Delete from FTS5
-                try:
-                    self.conn.execute("DELETE FROM facts_fts_content WHERE id=?", (f["id"],))
-                    self.conn.execute("INSERT INTO facts_fts(facts_fts, rowid, entity_name, predicate, object_text) VALUES('delete', ?, '', '', '')", (f["id"],))
-                except: pass
+                    self.conn.execute("DELETE FROM facts_vec WHERE fact_id=?", (fact["id"],))
+                except Exception:
+                    pass
+            self.conn.execute("DELETE FROM facts_fts_content WHERE id=?", (fact["id"],))
 
         # Delete relations
         rel_count = self.conn.execute(
@@ -1277,20 +1281,33 @@ JSON:"""
             (eid, eid)).fetchone()[0]
         self.conn.execute("DELETE FROM relations WHERE subject_id=? OR object_id=?", (eid, eid))
 
-        # Delete facts (preserve in forget_log for audit)
-        facts = self.conn.execute(
-            "SELECT id, predicate, object_text FROM facts WHERE subject_id=?", (eid,)
-        ).fetchall()
-        for f in facts:
+        # Preserve a sanitized fact-level audit entry before deletion.
+        for fact in facts:
+            audit_object = fact["object_text"]
+            if entity_name.casefold() in audit_object.casefold():
+                audit_object = "[redacted]"
             self.conn.execute(
                 "INSERT INTO forget_log(fact_id, subject_id, predicate, object_text, "
                 "utility_score, action, reason) VALUES(?,?,?,?,?,?,?)",
-                (f["id"], eid, f["predicate"], f["object_text"], 0.0,
+                (fact["id"], fact["subject_id"], fact["predicate"], audit_object, 0.0,
                  "gdpr_deleted", f"GDPR request {request_id}"))
 
         fact_count = len(facts)
-        self.conn.execute("DELETE FROM facts WHERE subject_id=?", (eid,))
+        for fact_id in fact_ids:
+            self.conn.execute(
+                "UPDATE facts SET superseded_by=NULL, invalidated_by_fact_id=NULL "
+                "WHERE superseded_by=? OR invalidated_by_fact_id=?",
+                (fact_id, fact_id),
+            )
+            self.conn.execute("DELETE FROM facts WHERE id=?", (fact_id,))
+
+        try:
+            self.conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+        except Exception:
+            pass
+
         self.conn.execute("DELETE FROM entities WHERE id=?", (eid,))
+        self.conn.execute("UPDATE entities SET summary='' WHERE summary LIKE ?", (pattern,))
 
         # Audit trail
         self.conn.execute(
@@ -1298,11 +1315,36 @@ JSON:"""
             "VALUES(?,?,?,?)",
             (eid, "GDPR right to erasure", request_id, "system"))
             
-        # Scrub Episodic memory
-        self.conn.execute("DELETE FROM memory_sessions WHERE full_text LIKE ?", (f"%{entity_name}%",))
-
-        # Scrub Profile layer
-        self.conn.execute("DELETE FROM memory_profile WHERE value LIKE ? OR key LIKE ?", (f"%{entity_name}%", f"%{entity_name}%"))
+        # Scrub every memory layer that can retain free text.
+        self.conn.execute(
+            "DELETE FROM episodes WHERE title LIKE ? OR body LIKE ?",
+            (pattern, pattern),
+        )
+        self.conn.execute(
+            "DELETE FROM memory_sessions WHERE title LIKE ? OR summary LIKE ? OR full_text LIKE ?",
+            (pattern, pattern, pattern),
+        )
+        self.conn.execute(
+            "DELETE FROM memory_profile WHERE key LIKE ? OR value LIKE ?",
+            (pattern, pattern),
+        )
+        self.conn.execute(
+            "DELETE FROM memory_skills WHERE name LIKE ? OR description LIKE ? OR triggers LIKE ?",
+            (pattern, pattern, pattern),
+        )
+        self.conn.execute(
+            "DELETE FROM memory_semantic WHERE subject LIKE ? OR canonical_key LIKE ? "
+            "OR statement LIKE ? OR details_json LIKE ? OR tags_json LIKE ?",
+            (pattern, pattern, pattern, pattern, pattern),
+        )
+        self.conn.execute(
+            "DELETE FROM schema_evolution WHERE pattern_description LIKE ? OR proposed_schema LIKE ?",
+            (pattern, pattern),
+        )
+        self.conn.execute(
+            "UPDATE forget_log SET object_text='[redacted]' WHERE object_text LIKE ?",
+            (pattern,),
+        )
 
         self.conn.commit()
         return {"status": "deleted", "entity": entity_name, "eid": eid,
@@ -1346,7 +1388,7 @@ JSON:"""
         new_fact_ids = []
         new_entity_ids = []
 
-        # ── JKG 5.1: TEMPORAL LINKING — connect end_year/resigned_from to works_at ──
+        # ── JKG 7.1: TEMPORAL LINKING — connect end_year/resigned_from to works_at ──
         data = self._link_temporal(data)
 
         with self.conn:
@@ -1954,8 +1996,6 @@ JSON:"""
             }
         
         # ── A* Search starting from each landmark ──
-        from scipy.spatial.distance import cosine as cos_dist
-        
         candidates = []  # (score, fact_data)
         seen_keys = set()
         
@@ -1976,7 +2016,10 @@ JSON:"""
                 if not fd:
                     continue
                 
-                cos_sim = 1 - cos_dist(query_vec, fact_vecs[i])
+                query_array = np.asarray(query_vec, dtype=np.float32).reshape(-1)
+                fact_array = np.asarray(fact_vecs[i], dtype=np.float32).reshape(-1)
+                denominator = np.linalg.norm(query_array) * np.linalg.norm(fact_array)
+                cos_sim = float(np.dot(query_array, fact_array) / denominator) if denominator else 0.0
                 if np.isnan(cos_sim) or np.isinf(cos_sim):
                     cos_sim = 0.0
                 temporal = fd["temporal_bonus"]
@@ -2124,7 +2167,7 @@ JSON:"""
         return {"new_links": new_links, "threshold": threshold}
 
     # ═══════════════════════════════════════════════
-    # JKG 5.1: PREDICATE ALIASES — semantic equivalents
+    # JKG 7.1: PREDICATE ALIASES — semantic equivalents
     # ═══════════════════════════════════════════════
 
     # When user asks "где работает", also match builds/founded/develops etc.
@@ -2240,7 +2283,7 @@ JSON:"""
         # Filter: drop timeframe mismatches and invalid present-tense facts
         candidates = [c for c in candidates if not c.get("_penalty")]
 
-        # JKG 5.1: Predicate expansion — for "где работает" questions,
+        # JKG 7.1: Predicate expansion — for "где работает" questions,
         # boost facts with work-alias predicates (builds, founded, etc.)
         if work_predicates and not is_past:
             for c in candidates:
@@ -2446,7 +2489,7 @@ JSON:"""
         return {"status": "deleted", "entity": name}
 
     # ═══════════════════════════════════════════════════════════════
-    # JKG 7.0: UNIFIED MEMORY FABRIC — Multi-Layer Ingest API
+    # JKG 7.1: UNIFIED MEMORY FABRIC — Multi-Layer Ingest API
     # ═══════════════════════════════════════════════════════════════
 
     # ── PROFILE LAYER ─────────────────────────────────────────────
@@ -2958,7 +3001,7 @@ JSON:"""
         return results[:limit]
 
     # ═══════════════════════════════════════════════════════════════
-    # JKG 7.0: UNIFIED QUERY — Multi-layer search with CLARK fusion
+    # JKG 7.1: UNIFIED QUERY — Multi-layer search with CLARK fusion
     # ═══════════════════════════════════════════════════════════════
 
     def query(self, text: str, layers: list = None, limit: int = 10) -> dict:
@@ -3179,7 +3222,7 @@ JSON:"""
         }
 
     # ═══════════════════════════════════════════════════════════════
-    # JKG 7.0: SESSION START INJECTION ENGINE
+    # JKG 7.1: SESSION START INJECTION ENGINE
     # ═══════════════════════════════════════════════════════════════
 
     def session_start_context(self, owner: str = "алтынай",
@@ -3289,11 +3332,11 @@ JSON:"""
         return f"══════════════════════════════════════════════\n{header}\n══════════════════════════════════════════════\n{body}"
 
     # ═══════════════════════════════════════════════════════════════
-    # JKG 7.0: SYNC BRIDGES — Auto-ingest from other systems
+    # JKG 7.1: SYNC BRIDGES — Auto-ingest from other systems
     # ═══════════════════════════════════════════════════════════════
 
     def sync_from_memory(self, content: str, target: str = "memory") -> dict:
-        """Bridge from built-in memory tool → JKG 7.0.
+        """Bridge from built-in memory tool → JKG 7.1.
 
         When memory(action='add') is called, this auto-indexes into the right layer.
         target='user' → profile layer, target='memory' → factual layer.
@@ -3305,7 +3348,7 @@ JSON:"""
 
     def sync_from_session(self, session_id: str, transcript: str, source: str = "terminal",
                           summary: str = "") -> dict:
-        """Bridge from session end → JKG 7.0 episodic + factual layers."""
+        """Bridge from session end → JKG 7.1 episodic + factual layers."""
         return self.remember_session(
             session_id=session_id, text=transcript, source=source,
             summary=summary, importance=0.7
@@ -3313,7 +3356,7 @@ JSON:"""
 
     def sync_from_skill(self, name: str, description: str = "",
                         triggers: list = None, category: str = "general") -> dict:
-        """Bridge from skill create/update → JKG 7.0 procedural layer."""
+        """Bridge from skill create/update → JKG 7.1 procedural layer."""
         return self.index_skill(name=name, description=description,
                                 triggers=triggers, category=category)
 
@@ -3543,7 +3586,7 @@ if __name__ == "__main__":
         result = hm.propagate_confidence(iterations=iterations)
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
-    # ═══ JKG 7.0: Unified Query CLI ═══
+    # ═══ JKG 7.1: Unified Query CLI ═══
 
     elif cmd == "query":
         query = " ".join(sys.argv[2:])

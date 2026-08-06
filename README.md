@@ -38,7 +38,7 @@ Memory-heavy applications often split preferences, facts, transcripts, rules, an
 - Bi-temporal facts, confidence propagation, conflict invalidation, and utility-based forgetting
 - Local deterministic embeddings by default; Gemini embeddings are optional
 - Optional DeepSeek-powered extraction, reranking, and summarization
-- GDPR-oriented deletion workflow with an audit trail
+- Deletion workflow with an audit trail (beta)
 - CLI and Python API
 
 ## Architecture
@@ -187,7 +187,7 @@ These results are preliminary and are not a substitute for a full, independently
 
 ## Project status
 
-JKG 7.1 is **beta software**. The core package and semantic-memory tests are covered by CI, but several advanced behaviors still need broader stress testing. See [Architecture Audit & Fix Checklist](docs/BUG_REPORT_AND_FIXES.md) for the current engineering notes.
+JKG 7.1 is **beta software**. The core package and semantic-memory suite are tested locally, but several advanced behaviors still need broader stress testing. See [Architecture Audit & Fix Checklist](docs/BUG_REPORT_AND_FIXES.md) for the current engineering notes.
 
 ## Development
 

@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import logging
+import tempfile
 import traceback
 
 # Setup basic logging to suppress noisy external libs
@@ -12,14 +13,19 @@ from jkg.memory import HybridMemory
 
 def run_all_tests():
     report = []
-    report.append("# JKG 7.0 Memory System Evaluation Report")
+    report.append("# JKG 7.1 Memory System Evaluation Report")
     report.append("\n**Tester:** Teston Profile (Automated Evaluation)")
-    report.append("**Target:** `jessica-knowledge-graph` (Unified 4-layer memory SQLite+Vec)")
-    report.append("**Embedding Engine:** Gemini 2 (768-dim, API-based)\n")
+    report.append("**Target:** `jessica-knowledge-graph` (Unified 5-layer memory, SQLite + vectors)")
+    report.append("**Embedding Engine:** configured provider or deterministic local fallback\n")
     report.append("This report outlines the execution of 8 edge-case and functionality tests on the memory system.")
     report.append("\n---\n")
 
-    hm = HybridMemory()
+    temp_dir = tempfile.TemporaryDirectory()
+    test_db_path = os.environ.get(
+        "JKG_TEST_DB_PATH",
+        os.path.join(temp_dir.name, "jkg-evaluation.sqlite3"),
+    )
+    hm = HybridMemory(db_path=test_db_path)
     
     # helper for appending
     def add_result(title, status, expected, actual, duration):
@@ -161,10 +167,13 @@ def run_all_tests():
     except Exception as e:
         add_result("Test 8: Semantic Noise Injection", False, "Isolates fruit context from tech/music context", f"Crashed: {str(e)}", time.time() - start)
 
-    with open("/root/jkg/jkg_test_results.md", "w", encoding="utf-8") as f:
+    report_path = os.environ.get("JKG_TEST_REPORT", "jkg_test_results.md")
+    with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report))
-        
-    print("Tests finished. Report written to /root/jkg/jkg_test_results.md")
+
+    hm.conn.close()
+    temp_dir.cleanup()
+    print(f"Tests finished. Report written to {report_path}")
 
 if __name__ == "__main__":
     run_all_tests()

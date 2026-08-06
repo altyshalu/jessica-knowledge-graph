@@ -1,13 +1,15 @@
-# PR Notes
+# Release Notes — JKG 7.1
 
 ## Scope
-This branch is intended for release preparation of the `fix/architecture-flaws` work already present in the repository.
 
-Included in this final cleanup:
-- packaging metadata alignment to JKG 7.1
-- README clarification for optional Gemini embeddings setup
-- local artifact ignore rules for verification outputs
-- quickstart copy cleanup to match current package version
+JKG 7.1 introduces the unified five-layer memory model and prepares the package for public beta use.
+
+Included in this release:
+- semantic memory for durable project, tool, and rule knowledge
+- unified retrieval across semantic, profile, factual, episodic, and procedural layers
+- optional Gemini embeddings with deterministic local fallback
+- package metadata, quickstart, and public documentation aligned to JKG 7.1
+- local artifact and secret ignore rules
 
 ## Verification
 Suggested local verification before push/PR:
@@ -17,20 +19,19 @@ python -m compileall jkg
 python run_tests.py   # helper included in this branch
 ```
 
-Current local status on this branch:
+Current extended-test status:
 - PASS: multi-layer fusion
-- FAIL: bi-temporal validity
+- PASS: bi-temporal validity
 - PASS: CLARK confidence update
 - PASS: conflict resolution
 - PASS: intentional forgetting
 - PASS: self-evolving schema
-- FAIL: GDPR cascading delete completeness
+- PASS: cascading deletion across all memory layers
 - FAIL: semantic noise isolation
 
 ## Known limitations still present
-These remain unresolved on this branch and should be treated as follow-up work, not as solved problems:
-- temporal reasoning still misses the 2024 Bishkek case in the current test harness
-- GDPR delete still leaves traces in at least some query paths
-- semantic disambiguation still mixes contexts in noisy queries
+The remaining unresolved scenario should be treated as follow-up work, not as solved behavior:
+
+- semantic disambiguation can still mix contexts in noisy queries when using deterministic local fallback embeddings
 
 See `docs/BUG_REPORT_AND_FIXES.md` for the detailed audit context.

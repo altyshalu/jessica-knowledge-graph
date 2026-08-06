@@ -81,6 +81,35 @@ class SemanticMemoryTests(unittest.TestCase):
         self.assertIn("stable memory", context.lower())
         self.assertIn("durable truths", context.lower())
 
+    def test_verified_deletion_scrubs_all_memory_layers(self):
+        self.hm.remember("Alice works with Bob")
+        self.hm.remember_profile("Alice prefers concise answers")
+        self.hm.remember_project(
+            "Alice owns the launch checklist.",
+            project="jkg",
+            canonical_key="project:jkg:alice-checklist",
+        )
+        self.hm.remember_session("session-alice", "Alice reviewed the launch plan")
+        self.hm.index_skill("alice-review", description="Review work assigned to Alice")
+
+        result = self.hm.gdpr_delete("alice", request_id="test-001", verified=True)
+
+        self.assertEqual(result["status"], "deleted")
+        self.assertFalse(self.hm.query("Who is Alice?")["results"])
+        for table, columns in {
+            "episodes": ("title", "body"),
+            "memory_profile": ("key", "value"),
+            "memory_sessions": ("title", "summary", "full_text"),
+            "memory_skills": ("name", "description", "triggers"),
+            "memory_semantic": ("subject", "canonical_key", "statement"),
+        }.items():
+            predicate = " OR ".join(f"{column} LIKE ?" for column in columns)
+            row = self.hm.conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {predicate}",
+                tuple("%Alice%" for _ in columns),
+            ).fetchone()
+            self.assertEqual(row[0], 0, table)
+
 
 if __name__ == "__main__":
     unittest.main()
