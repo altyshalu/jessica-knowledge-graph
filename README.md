@@ -5,7 +5,7 @@
 ### One local database for semantic, profile, factual, episodic, and procedural memory
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-7.1.0-7C3AED)](https://github.com/altyshalu/jessica-knowledge-graph)
+[![Version](https://img.shields.io/badge/version-8.0.0-7C3AED)](https://github.com/altyshalu/jessica-knowledge-graph)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22C55E)](LICENSE)
 [![Status: Beta](https://img.shields.io/badge/status-beta-F59E0B)](#project-status)
 
@@ -31,11 +31,13 @@ Memory-heavy applications often split preferences, facts, transcripts, rules, an
 
 ### Highlights
 
-- One SQLite database for all memory layers
+- One isolated SQLite database per namespace, with all five memory layers
 - Unified cross-layer query with CLARK-style score fusion
 - Knowledge graph traversal, entity resolution, and path finding
 - BM25 full-text search plus vector similarity through `sqlite-vec`
-- Bi-temporal facts, confidence propagation, conflict invalidation, and utility-based forgetting
+- Bi-temporal facts, explicit corrections, conflict invalidation, and utility-based forgetting
+- Persisted vector indexes for every layer and an embedding compatibility registry
+- Feedback, access history, entity aliases, consolidation, and bounded context assembly
 - Local deterministic embeddings by default; Gemini embeddings are optional
 - Optional DeepSeek-powered extraction, reranking, and summarization
 - Deletion workflow with an audit trail (beta)
@@ -58,11 +60,13 @@ Memory-heavy applications often split preferences, facts, transcripts, rules, an
                             one SQLite database
 ```
 
-The factual layer uses CLARK retrieval in three stages:
+The factual layer uses a CLARK-inspired hybrid retrieval pipeline:
 
 1. **Value Iteration** propagates confidence through the graph.
-2. **A\* Search** selects relevant entities using graph importance, semantic similarity, and temporal signals.
-3. **Confidence Update** reinforces retrieved facts and their neighbors.
+2. **Best-first retrieval** seeds candidates with vector and BM25 results, then expands graph neighbors.
+3. **Calibrated ranking** combines semantic, lexical, temporal, evidence-confidence, and graph-distance signals.
+
+Retrieval never increases truth confidence. Reads update a separate salience score and access log.
 
 ## Quick start
 
@@ -82,7 +86,7 @@ python -m pip install -e .
 ```python
 from jkg import HybridMemory
 
-memory = HybridMemory(db_path="./data/jkg.sqlite3")
+memory = HybridMemory(db_path="./data/jkg.sqlite3", namespace="my-product")
 
 memory.remember("Alice works at Acme since 2023")
 memory.remember_profile("Alice prefers concise answers")
@@ -120,6 +124,7 @@ JKG works without API keys. When no embedding provider is configured, it uses de
 | Variable | Purpose | Default |
 |---|---|---|
 | `JKG_DB_PATH` | SQLite database location | `jkg/memory_v3.db` |
+| `JKG_NAMESPACE` | Physical memory namespace | `default` |
 | `GEMINI_API_KEY` | Enables Gemini embeddings | unset |
 | `DEEPSEEK_API_KEY` | Enables remote extraction and synthesis | unset |
 | `JKG_ENV_PATH` | Path to a custom `.env` file | auto-discovery |
@@ -153,7 +158,13 @@ memory.index_skill("code-review", description="...", triggers=["review PR"])
 
 # Unified retrieval
 memory.query("...", layers=["semantic", "profile", "factual"])
-memory.session_start_context()
+memory.session_start_context(max_chars=8000)
+
+# Lifecycle and maintenance
+memory.feedback("factual", fact_id, "useful")
+memory.add_entity_alias("alice", "Al")
+memory.consolidate(dry_run=True)
+memory.reindex_embeddings(force=True)
 ```
 
 More detail about durable project, tool, and rule memory is available in [Semantic Memory](docs/SEMANTIC_MEMORY.md).
@@ -172,7 +183,7 @@ Run `jkg` without arguments to print database statistics. An unknown command pri
 
 ## Benchmarks
 
-The preliminary LongMemEval-S run reports **96.8% Recall@5** on 100 of 500 questions and **100% Recall@10** for that sample. The benchmark runner and methodology are available in [`benchmark/run_longmemeval.py`](benchmark/run_longmemeval.py).
+An exploratory LongMemEval-S script is available in [`benchmark/run_longmemeval.py`](benchmark/run_longmemeval.py). Its historical sample results are not claimed as a reproducible JKG 8 benchmark because the script evaluates a specialized retrieval index rather than the complete public `HybridMemory` pipeline.
 
 These results are preliminary and are not a substitute for a full, independently reproduced benchmark. Workload, embedding backend, hardware, and dataset size can materially change results.
 
@@ -181,13 +192,14 @@ These results are preliminary and are not a substitute for a full, independently
 - Set `JKG_DB_PATH` to a persistent application data directory; do not keep production data inside the installed package.
 - Back up the SQLite database and test restore procedures before relying on it for durable state.
 - Keep `.env` and API keys outside version control and rotate any key that may have been exposed.
-- Use one embedding dimension per database. Switching between local 384-dimensional and Gemini 768-dimensional embeddings requires a fresh database or a migration.
+- The embedding registry rejects an incompatible provider/model/dimension. Reopen with `reindex_on_mismatch=True` for an explicit rebuild, preferably after a backup.
+- Use a namespace per user, workspace, or tenant. Namespaces map to separate database files to prevent cross-tenant reads.
 - SQLite is a strong fit for a single service instance. Evaluate a server database or explicit coordination before using one database file across multiple hosts.
 - Run privacy-deletion tests against your own ingestion paths before making regulatory guarantees.
 
 ## Project status
 
-JKG 7.1 is **beta software**. The core package and semantic-memory suite are tested locally, but several advanced behaviors still need broader stress testing. See [Architecture Audit & Fix Checklist](docs/BUG_REPORT_AND_FIXES.md) for the current engineering notes.
+JKG 8.0 is **beta software**. Correctness, namespace isolation, lifecycle, and vector-index invariants are tested locally, but broader load, migration, and retrieval-quality testing is still required.
 
 ## Development
 

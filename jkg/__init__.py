@@ -1,10 +1,10 @@
-"""
-JKG 7.1 — Unified Memory Fabric.
-Semantic + Profile + Factual + Episodic + Procedural memory.
-Single SQLite database. CLARK retrieval (Value Iteration + A*).
-Dynamic session-start context injection. Sync bridges.
-"""
+"""JKG 8 — local-first, five-layer memory for Python applications."""
+from .config import EmbeddingConfigurationError, MemoryConfig
+from .lifecycle import ContextBudget, FeedbackSignal, MemoryAction
 from .memory import HybridMemory
 
-__version__ = "7.1.0"
-__all__ = ["HybridMemory"]
+__version__ = "8.0.0"
+__all__ = [
+    "HybridMemory", "MemoryConfig", "EmbeddingConfigurationError",
+    "ContextBudget", "FeedbackSignal", "MemoryAction",
+]

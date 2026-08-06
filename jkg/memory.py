@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-JKG 7.1 — Unified Memory Fabric: semantic, profile, factual, episodic, and procedural memory.
-ONE SQLite database. Zero conflicts. No external APIs except LLM extraction.
+JKG 8 — semantic, profile, factual, episodic, and procedural memory.
+One isolated SQLite database per namespace; remote providers are optional.
 """
 import os, sys, json, sqlite3, re, hashlib, math, time, heapq
 from datetime import datetime
@@ -12,6 +12,13 @@ try:
 except Exception:
     requests = None
 import numpy as np
+from .config import (
+    EmbeddingConfigurationError,
+    MemoryConfig,
+    namespace_db_path,
+    normalize_namespace,
+)
+from .lifecycle import ContextBudget, FeedbackSignal
 try:
     from sentence_transformers import SentenceTransformer
 except Exception:
@@ -30,7 +37,7 @@ _USE_GEMINI = bool(os.environ.get("GEMINI_API_KEY", ""))
 EMBEDDING_DIM = 768 if _USE_GEMINI else 384
 EMBEDDING_MODEL = os.environ.get(
     "JKG_EMBEDDING_MODEL",
-    "gemini-embedding-2" if _USE_GEMINI else "all-MiniLM-L6-v2"
+    "gemini-embedding-001" if _USE_GEMINI else "all-MiniLM-L6-v2"
 )
 
 def _load_env():
@@ -282,7 +289,10 @@ def _fallback_extract_entities_payload(text: str) -> dict:
 class HybridMemory:
     """Unified five-layer memory backed by one SQLite database."""
 
-    def __init__(self, db_path=DB_PATH, embedding_model=EMBEDDING_MODEL):
+    def __init__(self, db_path=DB_PATH, embedding_model=EMBEDDING_MODEL,
+                 namespace: str = None, reindex_on_mismatch: bool = False):
+        self.namespace = normalize_namespace(namespace)
+        db_path = namespace_db_path(db_path, self.namespace)
         # Handle special SQLite paths like ":memory:"
         if db_path not in (":memory:", "") and os.path.dirname(db_path):
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -312,6 +322,18 @@ class HybridMemory:
         # Lazy-load embedding model
         self._embedder = None
         self._embedder_name = embedding_model
+        provider = "gemini" if _USE_GEMINI else (
+            "sentence-transformers" if SentenceTransformer is not None else "hash"
+        )
+        model_name = embedding_model if provider != "hash" else "hash-v1"
+        self.config = MemoryConfig(
+            namespace=self.namespace,
+            db_path=db_path,
+            embedding_provider=provider,
+            embedding_model=model_name,
+            embedding_dimensions=EMBEDDING_DIM,
+        )
+        self._validate_embedding_registry(reindex_on_mismatch=reindex_on_mismatch)
 
     @property
     def embedder(self):
@@ -382,6 +404,38 @@ class HybridMemory:
     def _init_db(self):
         """Create ALL tables in one transaction."""
         self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS memory_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS memory_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_layer TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                signal TEXT NOT NULL,
+                note TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_feedback_memory
+                ON memory_feedback(memory_layer, memory_id);
+            CREATE TABLE IF NOT EXISTS memory_access (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_layer TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                accessed_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_access_memory
+                ON memory_access(memory_layer, memory_id, accessed_at);
+            CREATE TABLE IF NOT EXISTS entity_aliases (
+                alias TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL,
+                confidence REAL DEFAULT 1.0,
+                source TEXT DEFAULT 'manual',
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY(entity_id) REFERENCES entities(id)
+            );
+
             -- GRAPH tables
             CREATE TABLE IF NOT EXISTS entities (
                 id TEXT PRIMARY KEY,
@@ -551,6 +605,9 @@ class HybridMemory:
             CREATE INDEX IF NOT EXISTS idx_semantic_scope ON memory_semantic(scope);
             CREATE INDEX IF NOT EXISTS idx_semantic_subject ON memory_semantic(subject);
         """)
+        fact_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(facts)")}
+        if "salience" not in fact_columns:
+            self.conn.execute("ALTER TABLE facts ADD COLUMN salience REAL DEFAULT 0.5")
         self.conn.commit()
 
         # Create vec0 table if sqlite-vec is available
@@ -566,15 +623,118 @@ class HybridMemory:
             self.has_vec = False
             print("WARNING: vec0 not available, vector search disabled", file=sys.stderr)
         if self.has_vec:
-            try:
-                self.conn.execute(f"""
-                    CREATE VIRTUAL TABLE IF NOT EXISTS memory_semantic_vec USING vec0(
-                        semantic_row_id INTEGER PRIMARY KEY,
-                        embedding float[{EMBEDDING_DIM}]
-                    )
-                """)
-            except Exception:
-                pass
+            for table, id_column in (
+                ("memory_semantic_vec", "semantic_row_id"),
+                ("memory_profile_vec", "profile_row_id"),
+                ("memory_session_vec", "session_row_id"),
+                ("memory_skill_vec", "skill_row_id"),
+            ):
+                try:
+                    self.conn.execute(f"""
+                        CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(
+                            {id_column} INTEGER PRIMARY KEY,
+                            embedding float[{EMBEDDING_DIM}]
+                        )
+                    """)
+                except Exception:
+                    pass
+        self.conn.commit()
+
+    def _validate_embedding_registry(self, reindex_on_mismatch: bool = False):
+        """Refuse to mix vectors produced by incompatible embedding configs."""
+        signature = self.config.embedding_signature
+        row = self.conn.execute(
+            "SELECT value FROM memory_meta WHERE key='embedding_signature'"
+        ).fetchone()
+        if row is None:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO memory_meta(key, value, updated_at) VALUES(?,?,datetime('now'))",
+                (
+                    ("embedding_signature", signature),
+                    ("namespace", self.namespace),
+                    ("schema_version", "8"),
+                ),
+            )
+            self.conn.commit()
+            return
+        if row["value"] == signature:
+            return
+        if reindex_on_mismatch:
+            self.reindex_embeddings(force=True)
+            return
+        message = (
+            "Embedding configuration changed from "
+            f"{row['value']!r} to {signature!r}. Reopen with "
+            "reindex_on_mismatch=True or use a new namespace/database."
+        )
+        self.conn.close()
+        raise EmbeddingConfigurationError(message)
+
+    def _replace_vector(self, table: str, id_column: str, row_id: int, text: str):
+        if not self.has_vec:
+            return
+        vector = np.asarray(self._encode(text), dtype=np.float32)
+        self.conn.execute(
+            f"INSERT OR REPLACE INTO {table}({id_column}, embedding) VALUES(?,?)",
+            (row_id, vector.tobytes()),
+        )
+
+    def reindex_embeddings(self, force: bool = False) -> dict:
+        """Rebuild every vector layer and update the embedding registry."""
+        if not force:
+            raise ValueError("Reindex is destructive; pass force=True after making a backup.")
+        if not self.has_vec:
+            raise RuntimeError("sqlite-vec is required to rebuild vector indexes")
+
+        tables = {
+            "facts_vec": "fact_id",
+            "memory_semantic_vec": "semantic_row_id",
+            "memory_profile_vec": "profile_row_id",
+            "memory_session_vec": "session_row_id",
+            "memory_skill_vec": "skill_row_id",
+        }
+        # vec0 fixes dimensions when a table is created. Recreate tables so a
+        # provider dimension change is a real migration rather than a corrupt mix.
+        for table in tables:
+            self.conn.execute(f"DROP TABLE IF EXISTS {table}")
+        for table, id_column in tables.items():
+            self.conn.execute(f"""
+                CREATE VIRTUAL TABLE {table} USING vec0(
+                    {id_column} INTEGER PRIMARY KEY,
+                    embedding float[{self.config.embedding_dimensions}]
+                )
+            """)
+
+        counts = {name: 0 for name in ("facts", "semantic", "profile", "sessions", "skills")}
+        for row in self.conn.execute(
+            "SELECT f.id, e.name, f.predicate, f.object_text FROM facts f JOIN entities e ON e.id=f.subject_id"
+        ).fetchall():
+            self._replace_vector("facts_vec", "fact_id", row["id"],
+                                 f"{row['name']} {row['predicate']} {row['object_text']}")
+            counts["facts"] += 1
+        for row in self.conn.execute("SELECT * FROM memory_semantic").fetchall():
+            self._replace_vector("memory_semantic_vec", "semantic_row_id", row["id"],
+                                 f"{row['kind']} {row['scope']} {row['subject']} {row['statement']} {row['tags_json']}")
+            counts["semantic"] += 1
+        for row in self.conn.execute("SELECT * FROM memory_profile").fetchall():
+            self._replace_vector("memory_profile_vec", "profile_row_id", row["id"],
+                                 f"{row['key']} {row['value']} {row['category']}")
+            counts["profile"] += 1
+        for row in self.conn.execute("SELECT rowid AS vector_id, * FROM memory_sessions").fetchall():
+            self._replace_vector("memory_session_vec", "session_row_id", row["vector_id"],
+                                 f"{row['title']} {row['summary']} {row['full_text']}")
+            counts["sessions"] += 1
+        for row in self.conn.execute("SELECT rowid AS vector_id, * FROM memory_skills").fetchall():
+            self._replace_vector("memory_skill_vec", "skill_row_id", row["vector_id"],
+                                 f"{row['name']} {row['description']} {row['triggers']} {row['category']}")
+            counts["skills"] += 1
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO memory_meta(key,value,updated_at) VALUES('embedding_signature',?,datetime('now'))",
+            (self.config.embedding_signature,),
+        )
+        self.conn.commit()
+        return {"status": "ok", "embedding_signature": self.config.embedding_signature, "indexed": counts}
 
     # ═══════════════════════════════════════════════
     # UTILS
@@ -585,6 +745,21 @@ class HybridMemory:
 
     def _norm(self, s: str) -> str:
         return s.lower().strip()
+
+    _SEARCH_STOPWORDS = {
+        "the", "and", "for", "with", "from", "that", "this", "what", "when",
+        "where", "who", "why", "how", "tell", "about", "please", "would", "could",
+        "are", "was", "were", "have", "has", "had", "you", "your", "me", "my",
+        "a", "an", "of", "to", "in", "on", "is", "it", "do", "did",
+        "что", "как", "где", "когда", "кто", "почему", "про", "это", "для", "или",
+        "его", "ее", "её", "мне", "мой", "моя", "мои", "расскажи", "покажи",
+    }
+
+    def _search_terms(self, text: str) -> list:
+        return [
+            token for token in re.findall(r"[a-zA-Zа-яА-Я0-9_]+", self._norm(text))
+            if len(token) > 2 and token not in self._SEARCH_STOPWORDS
+        ]
 
     def _ensure_entity(self, name: str, etype: str = "entity") -> str:
         name = self._norm(name)
@@ -602,6 +777,11 @@ class HybridMemory:
         name = self._norm(name)
         exact = self.conn.execute("SELECT id FROM entities WHERE name=?", (name,)).fetchone()
         if exact: return exact["id"]
+        alias = self.conn.execute(
+            "SELECT entity_id FROM entity_aliases WHERE alias=?", (name,)
+        ).fetchone()
+        if alias:
+            return alias["entity_id"]
         fuzzy = self.conn.execute(
             "SELECT id, name FROM entities WHERE name LIKE ? LIMIT 1",
             (f"%{name}%",)).fetchone()
@@ -670,11 +850,13 @@ class HybridMemory:
         old_obj = self._norm(old_object)
         new_obj = self._norm(new_object)
 
-        if old_pred == new_pred:
-            return not self._same_object(old_obj, new_obj)
-
         old_family = self._predicate_family(old_pred)
         new_family = self._predicate_family(new_pred)
+
+        if old_pred == new_pred:
+            if self._same_object(old_obj, new_obj):
+                return False
+            return old_family in {"employment", "residence"}
 
         if old_family != new_family:
             return False
@@ -1676,6 +1858,8 @@ JSON:"""
                 ).fetchall()
                 vec_fact_ids = [r["fact_id"] for r in vec_rows]
                 if vec_fact_ids:
+                    vec_rank = {fact_id: rank for rank, fact_id in enumerate(vec_fact_ids)}
+                    vec_distance = {r["fact_id"]: float(r["distance"]) for r in vec_rows}
                     placeholders = ",".join(["?"] * len(vec_fact_ids))
                     fact_data = self.conn.execute(
                         f"SELECT f.id, e.name, f.predicate, f.object_text FROM facts f "
@@ -1683,9 +1867,11 @@ JSON:"""
                         f"WHERE f.id IN ({placeholders})",
                         vec_fact_ids
                     ).fetchall()
+                    fact_data = sorted(fact_data, key=lambda fact: vec_rank[fact["id"]])
                     results_lists.append([
                         {"fact_id": f["id"], "entity": f["name"],
-                         "predicate": f["predicate"], "value": f["object_text"]}
+                         "predicate": f["predicate"], "value": f["object_text"],
+                         "vector_distance": vec_distance[f["id"]]}
                         for f in fact_data
                     ])
             except Exception:
@@ -1699,13 +1885,13 @@ JSON:"""
 
     def _fts_query(self, query: str) -> str:
         """Convert user query to FTS5 query string."""
-        words = [w for w in re.findall(r'[^\s,?.!;:"\'()\[\]{}]+', query) if len(w) > 1]
+        words = self._search_terms(query)
         return " OR ".join(f'"{w}"' for w in words) if words else query
 
     def _keyword_overlap_bonus(self, query: str, entity: str, predicate: str, value: str) -> float:
         """Small lexical bonus/penalty to keep semantic retrieval anchored to the query."""
-        q_tokens = {w for w in re.findall(r"[a-zA-Zа-яА-Я0-9_]+", self._norm(query)) if len(w) > 2}
-        c_tokens = {w for w in re.findall(r"[a-zA-Zа-яА-Я0-9_]+", self._norm(f"{entity} {predicate} {value}")) if len(w) > 2}
+        q_tokens = set(self._search_terms(query))
+        c_tokens = set(self._search_terms(f"{entity} {predicate} {value}"))
         if not q_tokens or not c_tokens:
             return 0.0
 
@@ -1733,7 +1919,7 @@ JSON:"""
 
     def recall_graph(self, query: str, limit: int = 20) -> list:
         """Graph traversal recall from keyword-matched entities."""
-        words = [w for w in re.findall(r'[^\s,?.!;:"\'()\[\]{}]+', query.lower()) if len(w) > 1]
+        words = self._search_terms(query)
         if not words: return []
 
         conditions = " OR ".join(["name LIKE ?" for _ in words])
@@ -1787,7 +1973,7 @@ JSON:"""
     # ═══════════════════════════════════════════════
     # JKG 6.0: CLARK — Confidence-Layered Adaptive Retrieval for Knowledge
     # Inspired by Clark's Nutcracker spatial memory.
-    # Stage 1: Value Iteration → Stage 2: A* search → Stage 3: Confidence update
+    # Stage 1: graph signals → Stage 2: hybrid best-first retrieval → Stage 3: access tracking
     # ═══════════════════════════════════════════════
 
     def propagate_confidence(self, iterations: int = 5, lambda_factor: float = 0.7) -> dict:
@@ -1934,157 +2120,260 @@ JSON:"""
         return scored[:limit]
 
     def retrieve_clark(self, query: str, top_k: int = 10, beam_width: int = 5) -> list:
-        """Stage 2: A* search on the confidence-propagated graph.
-        
-        Uses temporal-aware heuristic:
-          h(node) = -log(cosine_similarity(embed(node), embed(query)) × temporal_bonus)
-        
-        Temporal bonus:
-          - Current facts (valid_until IS NULL): bonus = 1.0
-          - Historical facts (valid_until set): bonus = 0.15
-          - No temporal info: bonus = 0.5
-        
-        A* guarantees optimal path under admissible heuristic.
-        
-        Returns list of fact dicts (backward compatible).
+        """Query-seeded best-first retrieval over vector, text, and graph candidates.
+
+        CLARK is kept as the public API name, but the implementation deliberately
+        avoids claiming A* optimality. Candidate facts are seeded by KNN and BM25,
+        expanded over nearby graph entities, and scored on a calibrated 0..1 scale.
         """
         if not self.has_vec:
             return self.recall(query, limit=top_k)
-        
+
         query_vec = self._encode(query)
         timeframe = self._extract_query_timeframe(query)
         include_historical = timeframe.get("mode") == "bounded"
-        
-        # ── Stage 1: Landmark selection ──
-        landmarks = self._landmark_selection(limit=15, include_historical=include_historical)
-        if not landmarks:
+
+        candidate_limit = max(top_k * 8, 50)
+        vector_scores = {}
+        seed_fact_ids = set()
+
+        try:
+            rows = self.conn.execute(
+                "SELECT fact_id, distance FROM facts_vec "
+                "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                (query_vec.tobytes(), min(candidate_limit, 100)),
+            ).fetchall()
+            for row in rows:
+                distance = max(0.0, float(row["distance"]))
+                vector_scores[row["fact_id"]] = 1.0 / (1.0 + distance)
+                seed_fact_ids.add(row["fact_id"])
+        except Exception:
+            pass
+
+        try:
+            rows = self.conn.execute(
+                "SELECT rowid AS fact_id FROM facts_fts WHERE facts_fts MATCH ? LIMIT ?",
+                (self._fts_query(query), candidate_limit),
+            ).fetchall()
+            seed_fact_ids.update(row["fact_id"] for row in rows)
+        except Exception:
+            pass
+
+        if not seed_fact_ids:
             return self.recall(query, limit=top_k)
-        
-        # ── Precompute temporal bonus for all facts ──
-        now = datetime.now().strftime("%Y-%m-%d")
-        all_fact_data = {}
-        
-        # Schema-aware query
-        fact_cols = [c[1] for c in self.conn.execute("PRAGMA table_info(facts)").fetchall()]
-        has_forget = 'forget_status' in fact_cols
-        timeframe = self._extract_query_timeframe(query)
-        include_historical = timeframe.get("mode") == "bounded"
-        
-        fact_query = (
-            "SELECT f.id, f.subject_id, f.predicate, f.object_text, "
-            "f.confidence, f.valid_until, e.name as entity_name "
-            "FROM facts f JOIN entities e ON f.subject_id = e.id "
-        )
-        if has_forget and not include_historical:
-            fact_query += "WHERE f.forget_status = 'active'"
-        
-        for fact in self.conn.execute(fact_query).fetchall():
-            fid = fact["id"]
-            temporal_bonus = 1.0
-            if fact["valid_until"]:
-                if fact["valid_until"] < now:
-                    temporal_bonus = 0.15  # Historical
-                else:
-                    temporal_bonus = 0.8  # Expiring soon
-            all_fact_data[fid] = {
-                "subject_id": fact["subject_id"],
-                "entity_name": fact["entity_name"],
-                "predicate": fact["predicate"],
-                "object_text": fact["object_text"],
-                "confidence": fact["confidence"],
-                "temporal_bonus": temporal_bonus,
-            }
-        
-        # ── A* Search starting from each landmark ──
-        candidates = []  # (score, fact_data)
-        seen_keys = set()
-        
-        for landmark in landmarks:
-            fact_texts = []
-            for fid in landmark["fact_ids"]:
-                fd = all_fact_data.get(fid)
-                if fd:
-                    fact_texts.append(f"{fd['entity_name']} {fd['predicate']} {fd['object_text']}")
-            
-            if not fact_texts:
+
+        placeholders = ",".join("?" for _ in seed_fact_ids)
+        seed_entities = self.conn.execute(
+            f"SELECT DISTINCT subject_id FROM facts WHERE id IN ({placeholders})",
+            tuple(seed_fact_ids),
+        ).fetchall()
+
+        entity_depth = {}
+        frontier = []
+        for row in seed_entities:
+            entity_depth[row["subject_id"]] = 0
+            heapq.heappush(frontier, (0, row["subject_id"]))
+
+        max_entities = max(25, beam_width * 10)
+        while frontier and len(entity_depth) < max_entities:
+            depth, entity_id = heapq.heappop(frontier)
+            if depth >= 2:
                 continue
-            
-            fact_vecs = self.embedder.encode(fact_texts, normalize_embeddings=True)
-            
-            for i, fid in enumerate(landmark["fact_ids"]):
-                fd = all_fact_data.get(fid)
-                if not fd:
+            neighbors = self.conn.execute(
+                "SELECT CASE WHEN subject_id=? THEN object_id ELSE subject_id END AS neighbor "
+                "FROM relations WHERE subject_id=? OR object_id=? LIMIT ?",
+                (entity_id, entity_id, entity_id, max(beam_width, 1)),
+            ).fetchall()
+            for neighbor in neighbors:
+                neighbor_id = neighbor["neighbor"]
+                if neighbor_id in entity_depth:
                     continue
-                
+                entity_depth[neighbor_id] = depth + 1
+                heapq.heappush(frontier, (depth + 1, neighbor_id))
+
+        entity_ids = list(entity_depth)
+        entity_placeholders = ",".join("?" for _ in entity_ids)
+        active_clause = "" if include_historical else "AND f.forget_status='active'"
+        facts = self.conn.execute(
+            f"SELECT f.id, f.subject_id, f.predicate, f.object_text, f.confidence, "
+            f"f.valid_from, f.valid_until, e.name AS entity_name "
+            f"FROM facts f JOIN entities e ON e.id=f.subject_id "
+            f"WHERE f.subject_id IN ({entity_placeholders}) {active_clause} "
+            f"LIMIT ?",
+            (*entity_ids, candidate_limit * 2),
+        ).fetchall()
+
+        query_tokens = {
+            token for token in re.findall(r"[a-zA-Zа-яА-Я0-9_]+", self._norm(query))
+            if len(token) > 2
+        }
+        missing_vectors = [
+            fact for fact in facts if fact["id"] not in vector_scores
+        ]
+        if missing_vectors:
+            texts = [
+                f"{fact['entity_name']} {fact['predicate']} {fact['object_text']}"
+                for fact in missing_vectors
+            ]
+            try:
+                vectors = self.embedder.encode(texts, normalize_embeddings=True)
                 query_array = np.asarray(query_vec, dtype=np.float32).reshape(-1)
-                fact_array = np.asarray(fact_vecs[i], dtype=np.float32).reshape(-1)
-                denominator = np.linalg.norm(query_array) * np.linalg.norm(fact_array)
-                cos_sim = float(np.dot(query_array, fact_array) / denominator) if denominator else 0.0
-                if np.isnan(cos_sim) or np.isinf(cos_sim):
-                    cos_sim = 0.0
-                temporal = fd["temporal_bonus"]
-                confidence = fd["confidence"]
-                
-                score = confidence * cos_sim * temporal
-                score += self._keyword_overlap_bonus(query, fd["entity_name"], fd["predicate"], fd["object_text"])
-                key = f"{fd['entity_name']}|{fd['predicate']}|{fd['object_text']}"
-                
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    heapq.heappush(candidates, (-score, {
-                        "entity": fd["entity_name"],
-                        "predicate": fd["predicate"],
-                        "value": fd["object_text"],
-                        "clark_score": float(round(float(score), 4)),
-                        "confidence": float(round(float(confidence), 4)),
-                        "cosine_sim": float(round(float(cos_sim), 4)),
-                        "temporal_bonus": float(round(float(temporal), 3)),
-                    }))
-        
-        result = []
-        while candidates and len(result) < top_k:
-            _, item = heapq.heappop(candidates)
-            result.append(item)
-        
-        return result
+                for fact, vector in zip(missing_vectors, vectors):
+                    fact_array = np.asarray(vector, dtype=np.float32).reshape(-1)
+                    denominator = np.linalg.norm(query_array) * np.linalg.norm(fact_array)
+                    similarity = float(np.dot(query_array, fact_array) / denominator) if denominator else 0.0
+                    vector_scores[fact["id"]] = max(0.0, min(1.0, similarity))
+            except Exception:
+                pass
+
+        ranked = []
+        now = datetime.now()
+        for fact in facts:
+            candidate_tokens = {
+                token for token in re.findall(
+                    r"[a-zA-Zа-яА-Я0-9_]+",
+                    self._norm(f"{fact['entity_name']} {fact['predicate']} {fact['object_text']}")
+                ) if len(token) > 2
+            }
+            union = query_tokens | candidate_tokens
+            lexical = len(query_tokens & candidate_tokens) / len(union) if union else 0.0
+            lexical += self._keyword_overlap_bonus(
+                query, fact["entity_name"], fact["predicate"], fact["object_text"]
+            )
+            lexical = max(0.0, min(1.0, lexical))
+
+            temporal = 1.0
+            if fact["valid_until"]:
+                fact_end = self._parse_partial_date(fact["valid_until"], default_end=True)
+                temporal = 0.2 if fact_end and fact_end < now else 0.8
+            if timeframe.get("mode") != "any":
+                temporal = 1.0 if self._fact_matches_timeframe(
+                    fact["valid_from"], fact["valid_until"], timeframe
+                ) else 0.0
+
+            graph_proximity = 1.0 / (1.0 + entity_depth.get(fact["subject_id"], 2))
+            similarity = max(0.0, min(1.0, vector_scores.get(fact["id"], 0.0)))
+            confidence = max(0.0, min(1.0, float(fact["confidence"] or 0.5)))
+            score = (
+                0.45 * similarity +
+                0.25 * lexical +
+                0.15 * confidence +
+                0.10 * temporal +
+                0.05 * graph_proximity
+            )
+            ranked.append({
+                "fact_id": fact["id"],
+                "entity": fact["entity_name"],
+                "predicate": fact["predicate"],
+                "value": fact["object_text"],
+                "clark_score": round(max(0.0, min(1.0, score)), 4),
+                "confidence": round(confidence, 4),
+                "cosine_sim": round(similarity, 4),
+                "lexical_score": round(lexical, 4),
+                "temporal_bonus": round(temporal, 4),
+                "graph_depth": entity_depth.get(fact["subject_id"], 2),
+            })
+
+        ranked.sort(key=lambda item: item["clark_score"], reverse=True)
+        return ranked[:top_k]
 
     def _clark_confidence_update(self, retrieved: list, boost: float = 0.05):
-        """Stage 3: Post-retrieval — boost confidence of retrieved and neighboring facts.
-        
-        After a successful retrieval:
-        - Retrieved facts get +boost confidence
-        - Facts of same entities get +boost/3
+        """Record retrieval without mutating truth confidence.
+
+        Kept under its historical private name for compatibility. Confidence
+        represents evidence quality; salience and access history represent use.
         """
         if not retrieved:
             return 0
         
         updated = 0
         for item in retrieved:
-            entity_name = item.get("entity", "")
-            predicate = item.get("predicate", "")
-            value = item.get("value", "")
-            
-            eid = self._resolve_entity(entity_name)
-            if not eid:
+            fact_id = item.get("fact_id")
+            if not fact_id:
                 continue
-            
-            # Boost the retrieved fact
             self.conn.execute(
-                "UPDATE facts SET confidence = MIN(1.0, confidence + ?) "
-                "WHERE subject_id=? AND predicate=? AND object_text=?",
-                (boost, eid, predicate, value))
-            if self.conn.total_changes > 0:
-                updated += 1
-            
-            # Boost neighboring facts slightly
+                "UPDATE facts SET access_count=access_count+1, last_accessed_at=datetime('now'), "
+                "salience=MIN(1.0, salience + ?) WHERE id=?",
+                (boost, fact_id),
+            )
             self.conn.execute(
-                "UPDATE facts SET confidence = MIN(1.0, confidence + ?) "
-                "WHERE subject_id=? AND id != (SELECT id FROM facts WHERE subject_id=? AND predicate=? AND object_text=? LIMIT 1)",
-                (boost / 3, eid, eid, predicate, value))
-        
+                "INSERT INTO memory_access(memory_layer,memory_id) VALUES('factual',?)",
+                (str(fact_id),),
+            )
+            updated += 1
         self.conn.commit()
         return updated
 
+    def add_entity_alias(self, entity: str, alias: str, confidence: float = 1.0,
+                         source: str = "manual") -> dict:
+        entity_id = self._resolve_entity(entity)
+        if not entity_id:
+            entity_id = self._ensure_entity(entity)
+        normalized = self._norm(alias)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO entity_aliases(alias,entity_id,confidence,source) VALUES(?,?,?,?)",
+            (normalized, entity_id, max(0.0, min(1.0, confidence)), source),
+        )
+        self.conn.commit()
+        return {"status": "ok", "entity_id": entity_id, "alias": normalized}
+
+    def merge_entities(self, source: str, target: str) -> dict:
+        """Merge a duplicate entity into a canonical entity, preserving an alias."""
+        source_id = self._resolve_entity(source)
+        target_id = self._resolve_entity(target)
+        if not source_id or not target_id:
+            return {"status": "not_found", "source": source, "target": target}
+        if source_id == target_id:
+            return {"status": "noop", "entity_id": target_id}
+        self.conn.execute("UPDATE facts SET subject_id=? WHERE subject_id=?", (target_id, source_id))
+        self.conn.execute("UPDATE relations SET subject_id=? WHERE subject_id=?", (target_id, source_id))
+        self.conn.execute("UPDATE relations SET object_id=? WHERE object_id=?", (target_id, source_id))
+        self.conn.execute("UPDATE entity_aliases SET entity_id=? WHERE entity_id=?", (target_id, source_id))
+        self.conn.execute(
+            "INSERT OR REPLACE INTO entity_aliases(alias,entity_id,source) VALUES(?,?,?)",
+            (self._norm(source), target_id, "entity-merge"),
+        )
+        self.conn.execute("DELETE FROM entities WHERE id=?", (source_id,))
+        self.conn.commit()
+        return {"status": "merged", "source_id": source_id, "target_id": target_id}
+
+    def feedback(self, layer: str, memory_id, signal: str, note: str = "") -> dict:
+        """Attach explicit user feedback without rewriting source memory."""
+        allowed = {item.value for item in FeedbackSignal}
+        if signal not in allowed:
+            raise ValueError(f"signal must be one of: {', '.join(sorted(allowed))}")
+        self.conn.execute(
+            "INSERT INTO memory_feedback(memory_layer,memory_id,signal,note) VALUES(?,?,?,?)",
+            (layer, str(memory_id), signal, note[:1000]),
+        )
+        if layer == "factual" and signal in {"confirm", "useful"}:
+            self.conn.execute("UPDATE facts SET salience=MIN(1.0,salience+0.1) WHERE id=?", (memory_id,))
+        elif layer == "factual" and signal in {"reject", "not_useful"}:
+            self.conn.execute("UPDATE facts SET salience=MAX(0.0,salience-0.2) WHERE id=?", (memory_id,))
+        self.conn.commit()
+        return {"status": "recorded", "layer": layer, "memory_id": str(memory_id), "signal": signal}
+
+    def consolidate(self, dry_run: bool = True) -> dict:
+        """Find safe maintenance work; optionally remove only true orphan entities."""
+        orphans = self.conn.execute("""
+            SELECT id, name FROM entities e
+            WHERE NOT EXISTS (SELECT 1 FROM facts f WHERE f.subject_id=e.id)
+              AND NOT EXISTS (SELECT 1 FROM relations r WHERE r.subject_id=e.id OR r.object_id=e.id)
+              AND NOT EXISTS (SELECT 1 FROM entity_aliases a WHERE a.entity_id=e.id)
+        """).fetchall()
+        duplicate_aliases = self.conn.execute("""
+            SELECT lower(name) AS normalized, COUNT(*) AS count
+            FROM entities GROUP BY lower(name) HAVING COUNT(*) > 1
+        """).fetchall()
+        if not dry_run and orphans:
+            self.conn.executemany("DELETE FROM entities WHERE id=?", [(row["id"],) for row in orphans])
+            self.conn.commit()
+        return {
+            "dry_run": dry_run,
+            "orphan_entities": [dict(row) for row in orphans],
+            "duplicate_entity_groups": [dict(row) for row in duplicate_aliases],
+            "deleted": 0 if dry_run else len(orphans),
+        }
     # ═══════════════════════════════════════════════
     # BIDIRECTIONAL BRIDGE
     # ═══════════════════════════════════════════════
@@ -2226,17 +2515,17 @@ JSON:"""
     # ═══════════════════════════════════════════════
 
     def ask(self, question: str, owner: str = "алтынай") -> dict:
-        """JKG 6.0: Full CLARK pipeline — A* search + temporal awareness + confidence update."""
+        """Full hybrid pipeline with temporal awareness and access tracking."""
         # Detect if question is about past/present
         timeframe = self._extract_query_timeframe(question)
         past_indicators = ["раньше", "до", "был", "была", "было", "были", "прошлом",
                           "в 202", "история", "использовал", "работал", "was", "before"]
         is_past = any(w in question.lower() for w in past_indicators) or timeframe.get("mode") == "bounded"
 
-        # Step 1: CLARK retrieval (A* search, replaces old RRF recall)
+        # Step 1: hybrid best-first graph retrieval
         candidates = self.retrieve_clark(question, top_k=20)
 
-        # Step 1.5: Confidence update — boost retrieved facts (Clark's Nutcracker Stage 3)
+        # Step 1.5: record access and increase salience, never truth confidence
         self._clark_confidence_update(candidates, boost=0.05)
 
         # Step 2: Owner traversal (filter by validity)
@@ -2345,7 +2634,7 @@ JSON:"""
 
     def search_episodes(self, query: str, limit: int = 10) -> list:
         """Search raw episodes by keywords."""
-        words = [w for w in re.findall(r'[^\s,?.!;:"\'()\[\]{}]+', query.lower()) if len(w) > 1]
+        words = self._search_terms(query)
         if not words: return []
         conditions = " OR ".join(["body LIKE ?" for _ in words])
         params = [f"%{w}%" for w in words]
@@ -2457,8 +2746,10 @@ JSON:"""
             "vectors": vectors, "has_embeddings": self.has_vec,
             "schema_proposals": schema_proposals,
             "avg_utility": round(avg_util, 3) if avg_util else None,
-            "version": "5.0",
-            "architecture": "graph+embeddings+temporal+emotional+forgetting+self-evolving",
+            "version": "8.0.0",
+            "namespace": self.namespace,
+            "embedding_signature": self.config.embedding_signature,
+            "architecture": "five-layer+graph+full-text+vectors+temporal+lifecycle",
         }
 
     def list_entities(self, limit=50) -> list:
@@ -2537,6 +2828,17 @@ JSON:"""
                     confidence=excluded.confidence, source=excluded.source,
                     updated_at=datetime('now')
             """, (key, value, cat, conf, source))
+            row = self.conn.execute(
+                "SELECT id FROM memory_profile WHERE key=?", (key,)
+            ).fetchone()
+            if row:
+                try:
+                    self._replace_vector(
+                        "memory_profile_vec", "profile_row_id", row["id"],
+                        f"{key} {value} {cat}",
+                    )
+                except Exception:
+                    pass
             stored.append({"key": key, "value": value, "category": cat})
 
         self.conn.commit()
@@ -2844,20 +3146,27 @@ JSON:"""
             item["score"] = round((item.get("confidence", 0.5) * 0.55) + lexical_bonus + (lexical_hits * 0.12), 4)
             results.append(item)
 
-        # Remote embeddings are expensive and were the main source of query stalls.
-        # Only score a small fallback slice when lexical search did not already fill the request.
-        if len(results) < limit and embedding_candidates:
+        # Query persisted vectors rather than re-encoding every candidate.
+        if len(results) < limit and self.has_vec:
             try:
-                q_vec = self._encode(query)
-                for lexical_hits, lexical_bonus, searchable, row in embedding_candidates[:SEMANTIC_EMBED_LIMIT]:
-                    entry_vec = self._encode(searchable)
-                    cosine = float(np.dot(q_vec, entry_vec) / ((np.linalg.norm(q_vec) * np.linalg.norm(entry_vec)) + 1e-8))
+                q_vec = np.asarray(self._encode(query), dtype=np.float32)
+                vector_rows = self.conn.execute("""
+                    SELECT semantic_row_id, distance FROM memory_semantic_vec
+                    WHERE embedding MATCH ? AND k = ? ORDER BY distance
+                """, (q_vec.tobytes(), max(limit * 3, 10))).fetchall()
+                by_id = {row["id"]: row for row in base_rows}
+                existing_ids = {item["id"] for item in results}
+                for vector_row in vector_rows:
+                    row = by_id.get(vector_row["semantic_row_id"])
+                    if not row or row["id"] in existing_ids:
+                        continue
+                    cosine = max(0.0, 1.0 - float(vector_row["distance"]))
                     if terms and cosine < 0.18:
                         continue
                     item = dict(row)
                     item["layer"] = "semantic"
                     item["cosine_sim"] = cosine
-                    item["score"] = round((item.get("confidence", 0.5) * 0.45) + (cosine * 0.4) + lexical_bonus + (lexical_hits * 0.08), 4)
+                    item["score"] = round((item.get("confidence", 0.5) * 0.45) + (cosine * 0.45), 4)
                     results.append(item)
             except Exception:
                 pass
@@ -2904,6 +3213,17 @@ JSON:"""
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (sid, session_id, source, title or f"Session {session_id[:12]}",
               summary, text[:10000], emotion, emotion_intensity, importance))
+        session_row = self.conn.execute(
+            "SELECT rowid AS vector_id FROM memory_sessions WHERE id=?", (sid,)
+        ).fetchone()
+        if session_row:
+            try:
+                self._replace_vector(
+                    "memory_session_vec", "session_row_id", session_row["vector_id"],
+                    f"{title} {summary} {text[:10000]}",
+                )
+            except Exception:
+                pass
         self.conn.commit()
 
         # Also try to extract facts and profile updates from the session
@@ -2931,7 +3251,7 @@ JSON:"""
         norm_q = self._norm(query)
 
         # Keyword search
-        for term in norm_q.split():
+        for term in self._search_terms(norm_q):
             rows = self.conn.execute("""
                 SELECT id, session_id, source, title, summary, emotion, importance, created_at
                 FROM memory_sessions
@@ -2943,17 +3263,31 @@ JSON:"""
                 if r["id"] not in {x.get("id") for x in results}:
                     results.append(dict(r))
 
-        # Vector search if available
-        if self.has_vec and self.embedder:
+        # Persisted vector search
+        if self.has_vec:
             try:
-                q_vec = self._encode(query)
-                # For now, fall back to keyword — vector for sessions needs vec0 table
-                # This is a future optimization
-                pass
+                q_vec = np.asarray(self._encode(query), dtype=np.float32)
+                rows = self.conn.execute("""
+                    SELECT s.id, s.session_id, s.source, s.title, s.summary, s.emotion,
+                           s.importance, s.created_at, v.distance
+                    FROM memory_session_vec v
+                    JOIN memory_sessions s ON s.rowid=v.session_row_id
+                    WHERE v.embedding MATCH ? AND k = ? ORDER BY v.distance
+                """, (q_vec.tobytes(), max(limit * 2, 5))).fetchall()
+                known = {item["id"] for item in results}
+                for row in rows:
+                    if row["id"] in known:
+                        continue
+                    item = dict(row)
+                    item["retrieval_score"] = max(0.0, 1.0 - float(item.pop("distance")))
+                    results.append(item)
             except Exception:
                 pass
 
-        results.sort(key=lambda x: x["importance"], reverse=True)
+        for item in results:
+            lexical = self._lexical_similarity(query, f"{item.get('title', '')} {item.get('summary', '')}")
+            item["retrieval_score"] = max(item.get("retrieval_score", 0.0), lexical)
+        results.sort(key=lambda x: (x.get("retrieval_score", 0.0), x["importance"]), reverse=True)
         return results[:limit]
 
     # ── PROCEDURAL LAYER ──────────────────────────────────────────
@@ -2978,6 +3312,19 @@ JSON:"""
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (sid, name, description, triggers_json, category, version))
 
+        skill_row = self.conn.execute(
+            "SELECT rowid AS vector_id, id FROM memory_skills WHERE name=?", (name,)
+        ).fetchone()
+        if skill_row:
+            sid = skill_row["id"]
+            try:
+                self._replace_vector(
+                    "memory_skill_vec", "skill_row_id", skill_row["vector_id"],
+                    f"{name} {description} {triggers_json} {category}",
+                )
+            except Exception:
+                pass
+
         self.conn.commit()
         return {"status": "ok", "name": name, "id": sid, "action": "updated" if existing else "created"}
 
@@ -2985,7 +3332,7 @@ JSON:"""
         """Search procedural memory by keyword in name, description, and triggers."""
         norm_q = self._norm(query)
         results = []
-        for term in norm_q.split():
+        for term in self._search_terms(norm_q):
             rows = self.conn.execute("""
                 SELECT id, name, description, triggers, category, version
                 FROM memory_skills WHERE is_active=1
@@ -2997,8 +3344,96 @@ JSON:"""
                     d = dict(r)
                     try: d["triggers"] = json.loads(d.get("triggers", "[]"))
                     except: d["triggers"] = []
+                    d["retrieval_score"] = self._lexical_similarity(
+                        query, f"{d['name']} {d['description']} {' '.join(d['triggers'])}"
+                    )
                     results.append(d)
+        if self.has_vec:
+            try:
+                q_vec = np.asarray(self._encode(query), dtype=np.float32)
+                rows = self.conn.execute("""
+                    SELECT s.id, s.name, s.description, s.triggers, s.category, s.version,
+                           v.distance
+                    FROM memory_skill_vec v JOIN memory_skills s ON s.rowid=v.skill_row_id
+                    WHERE s.is_active=1 AND v.embedding MATCH ? AND k = ? ORDER BY v.distance
+                """, (q_vec.tobytes(), max(limit * 2, 5))).fetchall()
+                known = {item["id"] for item in results}
+                for row in rows:
+                    if row["id"] in known:
+                        continue
+                    item = dict(row)
+                    item["triggers"] = json.loads(item.get("triggers", "[]"))
+                    item["retrieval_score"] = max(0.0, 1.0 - float(item.pop("distance")))
+                    results.append(item)
+            except Exception:
+                pass
+        results.sort(key=lambda item: item.get("retrieval_score", 0.0), reverse=True)
         return results[:limit]
+
+    def _lexical_similarity(self, query: str, candidate: str) -> float:
+        query_tokens = {
+            token for token in re.findall(r"[a-zA-Zа-яА-Я0-9_]+", self._norm(query))
+            if len(token) > 2
+        }
+        candidate_tokens = {
+            token for token in re.findall(r"[a-zA-Zа-яА-Я0-9_]+", self._norm(candidate))
+            if len(token) > 2
+        }
+        union = query_tokens | candidate_tokens
+        return len(query_tokens & candidate_tokens) / len(union) if union else 0.0
+
+    def _fuse_layer_results(self, query: str, results: list, limit: int) -> list:
+        """Calibrate heterogeneous layer scores and remove duplicate context."""
+        query_norm = self._norm(query)
+        weights = {
+            "semantic": 1.0,
+            "profile": 1.0,
+            "factual": 1.05,
+            "episodic": 0.95,
+            "procedural": 0.95,
+        }
+        if any(term in query_norm for term in ("rule", "policy", "tool", "project", "правил", "инструмент", "проект")):
+            weights["semantic"] = 1.2
+        if any(term in query_norm for term in ("prefer", "profile", "like", "about me", "предпоч", "профил", "люб")):
+            weights["profile"] = 1.2
+        if any(term in query_norm for term in ("session", "discuss", "conversation", "yesterday", "сесс", "обсуж", "разговор", "вчера")):
+            weights["episodic"] = 1.2
+        if any(term in query_norm for term in ("how to", "workflow", "skill", "procedure", "как сделать", "навык", "процедур")):
+            weights["procedural"] = 1.2
+
+        grouped = defaultdict(list)
+        for result in results:
+            grouped[result.get("layer", "factual")].append(result)
+
+        fused = []
+        for layer, layer_results in grouped.items():
+            layer_results.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+            for rank, result in enumerate(layer_results):
+                item = dict(result)
+                raw_score = max(0.0, min(1.0, float(item.get("score", 0.0))))
+                rank_score = 1.0 / (rank + 1)
+                fused_score = (0.75 * raw_score + 0.25 * rank_score) * weights.get(layer, 1.0)
+                item["raw_score"] = round(raw_score, 4)
+                item["score"] = round(max(0.0, min(1.0, fused_score)), 4)
+                fused.append(item)
+
+        def signature(item):
+            if item.get("layer") == "profile":
+                return self._norm(f"profile|{item.get('key')}|{item.get('value')}")
+            if item.get("layer") == "semantic":
+                return self._norm(f"semantic|{item.get('canonical_key')}|{item.get('statement')}")
+            if item.get("layer") == "procedural":
+                return self._norm(f"procedural|{item.get('name')}|{item.get('description')}")
+            if item.get("layer") == "episodic":
+                return self._norm(f"episodic|{item.get('session_id', item.get('uuid', item.get('id')))}")
+            return self._norm(f"factual|{item.get('entity')}|{item.get('predicate')}|{item.get('value', item.get('object_text'))}")
+
+        deduplicated = {}
+        for item in fused:
+            key = signature(item)
+            if key not in deduplicated or item["score"] > deduplicated[key]["score"]:
+                deduplicated[key] = item
+        return sorted(deduplicated.values(), key=lambda item: item["score"], reverse=True)[:limit]
 
     # ═══════════════════════════════════════════════════════════════
     # JKG 7.1: UNIFIED QUERY — Multi-layer search with CLARK fusion
@@ -3038,7 +3473,7 @@ JSON:"""
             norm_q = self._norm(text)
             profile_results = []
             # Direct key/value search
-            for term in norm_q.split():
+            for term in self._search_terms(norm_q):
                 rows = self.conn.execute("""
                     SELECT key, value, category, confidence, source
                     FROM memory_profile WHERE is_active=1
@@ -3058,18 +3493,22 @@ JSON:"""
                 and not any(term in norm_q for term in ["where", "live", "lived", "moved", "location", "где", "живет", "жил", "переех", "recipe", "pie", "рецепт", "пирог"])
             ):
                 try:
-                    all_profile = self.conn.execute(
-                        "SELECT key, value, category, confidence, source FROM memory_profile WHERE is_active=1"
-                    ).fetchall()
-                    if all_profile:
-                        q_vec = self._encode(text)
+                    q_vec = np.asarray(self._encode(text), dtype=np.float32)
+                    rows = self.conn.execute("""
+                        SELECT p.key, p.value, p.category, p.confidence, p.source, v.distance
+                        FROM memory_profile_vec v
+                        JOIN memory_profile p ON p.id=v.profile_row_id
+                        WHERE p.is_active=1 AND v.embedding MATCH ? AND k = ?
+                        ORDER BY v.distance
+                    """, (q_vec.tobytes(), max(limit * 2, 5))).fetchall()
+                    if rows:
                         scored = []
-                        for p in all_profile:
-                            # Simple: encode key+value and compare
-                            p_text = f"{p['key']}: {p['value']}"
-                            p_vec = self._encode(p_text)
-                            sim = float(1 - np.dot(q_vec, p_vec) / (np.linalg.norm(q_vec) * np.linalg.norm(p_vec) + 1e-8))
+                        for p in rows:
+                            sim = max(0.0, 1.0 - float(p["distance"]))
+                            if sim < 0.18:
+                                continue
                             d = dict(p)
+                            d.pop("distance", None)
                             d["layer"] = "profile"
                             d["score"] = sim * 0.8  # embed score slightly lower than keyword
                             scored.append(d)
@@ -3188,7 +3627,16 @@ JSON:"""
                     ep_results.append(episode)
                 for r in ep_results:
                     r["layer"] = "episodic"
-                    r["score"] = float(r.get("importance", 0.5)) * 0.7  # sessions are contextual
+                    searchable = " ".join([
+                        str(r.get("title", "")), str(r.get("summary", "")),
+                        str(r.get("body", "")),
+                    ])
+                    relevance = self._lexical_similarity(text, searchable)
+                    contextual_bonus = self._keyword_overlap_bonus(text, "episode", "mentions", searchable)
+                    r["score"] = max(0.0, min(
+                        1.0,
+                        0.65 * relevance + 0.35 * float(r.get("importance", 0.5)) + contextual_bonus,
+                    ))
                 by_layer["episodic"] = len(ep_results)
                 all_results.extend(ep_results)
             except Exception as exc:
@@ -3201,16 +3649,16 @@ JSON:"""
                 sk_results = self.search_skills(text, limit=limit)
                 for r in sk_results:
                     r["layer"] = "procedural"
-                    r["score"] = 0.65  # skills are always relevant if matched
+                    searchable = f"{r.get('name', '')} {r.get('description', '')} {' '.join(r.get('triggers', []))}"
+                    r["score"] = min(1.0, 0.4 + 0.6 * self._lexical_similarity(text, searchable))
                 by_layer["procedural"] = len(sk_results)
                 all_results.extend(sk_results)
             except Exception as exc:
                 by_layer["procedural"] = 0
                 errors["procedural"] = str(exc)[:200]
 
-        # ── CLARK-style fusion: sort by score, deduplicate ──
-        all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-        top = all_results[:limit]
+        # ── Calibrated cross-layer fusion ──
+        top = self._fuse_layer_results(text, all_results, limit)
 
         return {
             "query": text,
@@ -3226,7 +3674,8 @@ JSON:"""
     # ═══════════════════════════════════════════════════════════════
 
     def session_start_context(self, owner: str = "алтынай",
-                              recent_sessions: int = 3) -> str:
+                              recent_sessions: int = 3,
+                              max_chars: int = 12000) -> str:
         """Generate a dynamic context block for session start prompt injection.
 
         Replaces flat memory injection with CLARK-ranked, multi-layer context
@@ -3326,8 +3775,20 @@ JSON:"""
             pass
 
         # Build final injection block
-        header = "DYNAMIC CONTEXT (JKG 7.1 Unified Memory Fabric)"
-        body = "\n\n".join(blocks) if blocks else "(no context loaded)"
+        header = "DYNAMIC CONTEXT (JKG 8 Unified Memory)"
+        budget = ContextBudget(max_chars=max(1000, max_chars))
+        layer_by_heading = {
+            "[Profile]": "profile", "[Active Facts]": "factual",
+            "[Recent Episodes]": "episodic", "[Semantic Memory]": "semantic",
+            "[Relevant Skills]": "procedural",
+        }
+        bounded = []
+        for block in blocks:
+            layer = next((value for heading, value in layer_by_heading.items() if block.startswith(heading)), "")
+            limit = budget.limit_for(layer) if layer else max_chars
+            bounded.append(block[:limit])
+        body = "\n\n".join(bounded) if bounded else "(no context loaded)"
+        body = body[:max_chars]
 
         return f"══════════════════════════════════════════════\n{header}\n══════════════════════════════════════════════\n{body}"
 

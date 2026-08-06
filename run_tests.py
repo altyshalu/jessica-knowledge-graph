@@ -13,7 +13,7 @@ from jkg.memory import HybridMemory
 
 def run_all_tests():
     report = []
-    report.append("# JKG 7.1 Memory System Evaluation Report")
+    report.append("# JKG 8 Memory System Evaluation Report")
     report.append("\n**Tester:** Teston Profile (Automated Evaluation)")
     report.append("**Target:** `jessica-knowledge-graph` (Unified 5-layer memory, SQLite + vectors)")
     report.append("**Embedding Engine:** configured provider or deterministic local fallback\n")
@@ -72,25 +72,29 @@ def run_all_tests():
     except Exception as e:
         add_result("Test 2: Bi-temporal Validity", False, "Resolve correct locations based on timeline", f"Crashed: {str(e)}", time.time() - start)
 
-    # 3. CLARK Retrieval (Confidence Update)
+    # 3. Retrieval relevance is stable and does not manufacture truth confidence
     start = time.time()
     try:
         hm.remember("Teston's favorite color is Quantum Blue")
         hm.remember("Teston's least favorite color is Rust Red")
         
-        # Query color multiple times to boost confidence
+        before = hm.conn.execute(
+            "SELECT confidence FROM facts WHERE object_text='Quantum Blue'"
+        ).fetchone()[0]
         for _ in range(5):
             hm.retrieve_clark("What is Teston's favorite color?")
-            
+        after = hm.conn.execute(
+            "SELECT confidence FROM facts WHERE object_text='Quantum Blue'"
+        ).fetchone()[0]
         q_res = hm.retrieve_clark("What is Teston's favorite color?")
         top_fact = q_res[0] if q_res else {}
         
-        if "quantum blue" in str(top_fact).lower():
-            add_result("Test 3: CLARK Retrieval Confidence", True, "Quantum Blue should rank higher due to retrieval boosting", f"Top fact matched expected. Fact: {top_fact.get('value')}", time.time() - start)
+        if "quantum blue" in str(top_fact).lower() and before == after:
+            add_result("Test 3: Retrieval Stability", True, "Relevant fact ranks first without confidence mutation", f"Top fact: {top_fact.get('value')}; confidence stable", time.time() - start)
         else:
-            add_result("Test 3: CLARK Retrieval Confidence", False, "Quantum Blue should rank higher", f"Top fact was: {top_fact.get('value')}", time.time() - start)
+            add_result("Test 3: Retrieval Stability", False, "Relevant fact ranks first without confidence mutation", f"Top: {top_fact.get('value')}; confidence {before} → {after}", time.time() - start)
     except Exception as e:
-        add_result("Test 3: CLARK Retrieval Confidence", False, "Quantum Blue should rank higher", f"Crashed: {str(e)}", time.time() - start)
+        add_result("Test 3: Retrieval Stability", False, "Relevant fact ranks first without confidence mutation", f"Crashed: {str(e)}", time.time() - start)
 
     # 4. Conflict Resolution
     start = time.time()

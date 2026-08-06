@@ -1,8 +1,7 @@
-# JKG 7.1 (Jessica Knowledge Graph) — Architecture Audit & Fix Checklist
+# JKG 8.0 — Architecture Audit and Remaining Work
 
 ## Current Situation
-JKG 7.1 is a "Unified Memory Fabric" that merges five memory layers (Semantic, Profile, Factual, Episodic, and Procedural) into a single SQLite database using `sqlite-vec`.
-The current automated evaluation passes 7 of 8 edge-case scenarios with deterministic local embeddings. Semantic noise isolation remains open; the other issues below have been remediated and retained for engineering history.
+JKG 8 keeps five memory layers in an isolated SQLite database per namespace. The current automated evaluation passes all 8 edge-case scenarios plus 9 unit/invariant tests.
 
 ## Bug Checklist & Remediation Plan
 
@@ -35,7 +34,7 @@ The current automated evaluation passes 7 of 8 edge-case scenarios with determin
 - **Expected Behavior:** Queries specifying a timeframe (e.g., "in 2024") should only return facts valid during that timeframe.
 
 ### 5. Semantic Noise Isolation
-- **Status:** Open.
+- **Status:** Resolved for the deterministic regression scenario in 8.0.
 - **What is it:** Ambiguous entities can still leak unrelated context into the top results when deterministic local fallback embeddings are used.
-- **Current mitigation:** Use a stronger configured embedding provider and restrict `query(..., layers=[...])` when the application knows the relevant memory layer.
+- **Current mitigation:** Stopword filtering, domain-aware episodic scoring, lexical gating, and calibrated layer fusion.
 - **Expected Behavior:** Context-specific queries should prioritize the correct entity sense and suppress unrelated meanings.
