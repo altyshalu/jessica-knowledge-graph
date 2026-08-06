@@ -11,7 +11,7 @@ JKG 8.0 focuses on memory correctness and production boundaries.
 - bounded session-start context
 - corrected semantic-noise and retrieval-stability evaluation scenarios
 
-Verified locally with 9 unit/invariant tests, 8 extended scenarios, compilation,
+Verified locally with 10 unit/invariant tests, 8 extended scenarios, compilation,
 package build, and metadata validation.
 
 Known limits: the package remains beta; multi-process write load, large migrations,
