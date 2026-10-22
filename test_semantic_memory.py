@@ -9,7 +9,7 @@ class SemanticMemoryTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmpdir.name, "memory.sqlite3")
-        self.hm = HybridMemory(db_path=self.db_path)
+        self.hm = HybridMemory(db_path=self.db_path, embedding_provider="hash")
 
     def tearDown(self):
         self.hm.conn.close()

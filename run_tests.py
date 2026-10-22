@@ -13,10 +13,11 @@ from jkg.memory import HybridMemory
 
 def run_all_tests():
     report = []
+    statuses = []
     report.append("# JKG 8 Memory System Evaluation Report")
     report.append("\n**Tester:** Teston Profile (Automated Evaluation)")
     report.append("**Target:** `jessica-knowledge-graph` (Unified 5-layer memory, SQLite + vectors)")
-    report.append("**Embedding Engine:** configured provider or deterministic local fallback\n")
+    report.append("**Embedding Engine:** configured provider (local semantic model by default; hash only when explicitly selected)\n")
     report.append("This report outlines the execution of 8 edge-case and functionality tests on the memory system.")
     report.append("\n---\n")
 
@@ -29,6 +30,7 @@ def run_all_tests():
     
     # helper for appending
     def add_result(title, status, expected, actual, duration):
+        statuses.append(bool(status))
         symbol = "✅ PASS" if status else "❌ FAIL"
         report.append(f"### {title}")
         report.append(f"- **Status:** {symbol}")
@@ -79,12 +81,12 @@ def run_all_tests():
         hm.remember("Teston's least favorite color is Rust Red")
         
         before = hm.conn.execute(
-            "SELECT confidence FROM facts WHERE object_text='Quantum Blue'"
+            "SELECT confidence FROM facts WHERE object_text='quantum blue'"
         ).fetchone()[0]
         for _ in range(5):
             hm.retrieve_clark("What is Teston's favorite color?")
         after = hm.conn.execute(
-            "SELECT confidence FROM facts WHERE object_text='Quantum Blue'"
+            "SELECT confidence FROM facts WHERE object_text='quantum blue'"
         ).fetchone()[0]
         q_res = hm.retrieve_clark("What is Teston's favorite color?")
         top_fact = q_res[0] if q_res else {}
@@ -178,6 +180,7 @@ def run_all_tests():
     hm.conn.close()
     temp_dir.cleanup()
     print(f"Tests finished. Report written to {report_path}")
+    return all(statuses)
 
 if __name__ == "__main__":
-    run_all_tests()
+    sys.exit(0 if run_all_tests() else 1)
