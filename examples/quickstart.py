@@ -1,43 +1,40 @@
 #!/usr/bin/env python3
+"""A no-API-key example. The first run downloads the local embedding model.
+
+Install with `python -m pip install -e .`, then run `python examples/quickstart.py`.
+The example uses a temporary database and does not modify your personal memory.
 """
-JKG 7.1 Quickstart — запусти и проверь память за 30 секунд.
-Требуется: pip install -e .
-"""
-import os
+import tempfile
+from pathlib import Path
+
 from jkg import HybridMemory
 
-# 1. Инициализация
-hm = HybridMemory()
 
-# 2. Запомнить факты
-print("🧠 Запоминаю факты...")
-hm.remember("""
-Алиса — CTO в Acme Corp, AI-стартапе из Сан-Франциско.
-Acme Corp делает AI-агентов для enterprise. 
-Главный конкурент — BetaCorp (YC W24).
-Алиса использует Python, PyTorch и Kubernetes.
-""")
-print(f"  Статистика: {hm.stats()}")
+def main():
+    with tempfile.TemporaryDirectory() as directory:
+        path = str(Path(directory) / "example.sqlite3")
+        memory = HybridMemory(db_path=path)
+        try:
+            fact = memory.remember("Алина работает в компании Acme с 2023 года")
+            profile = memory.remember_profile("Alice prefers concise answers")
+            memory.remember_rule(
+                "Create a backup copy before modifying important files.", rule_name="backups"
+            )
+            assert fact["facts"] == 1
+            assert profile["stored"] == 1
+            print("Employment:", memory.query("Где работает Алина?", layers=["factual"])["results"])
+            print("Preference:", memory.query("How does Alice prefer to communicate?", layers=["profile"])["results"])
+            print("Cross-language search:", memory.query("Что делать перед изменением важных файлов?", layers=["semantic"])["results"])
+        finally:
+            memory.conn.close()
 
-# 3. Графовый поиск (точные связи)
-print("\n🔍 Граф: Где работает Алиса?")
-for r in hm.recall("Где работает Алиса")[:3]:
-    print(f"  {r['entity']} {r['predicate']} {r['value']}")
+        reopened = HybridMemory(db_path=path)
+        try:
+            assert reopened.query("Alice", layers=["profile"])["results"]
+            print("Memory survived reopening the database.")
+        finally:
+            reopened.conn.close()
 
-# 4. Семантический поиск (синонимы!)
-print("\n🔍 Семантика: Кто rivals компании Алисы?")
-for r in hm.recall("rivals соперники конкуренты Алисы")[:3]:
-    print(f"  {r['entity']} {r['predicate']} {r['value']} (RRF: {r.get('rrf_score', 0):.4f})")
 
-# 5. Путь между сущностями
-print("\n🗺️  Путь: Алиса → BetaCorp?")
-path = hm.find_path("алиса", "betacorp")
-if path.get("path"):
-    print(f"  {' '.join(path['path'])} ({path['length']} hops)")
-
-# 6. Вопрос-ответ
-print("\n💬 ASK: Расскажи про компанию Алисы и её конкурентов")
-result = hm.ask("Расскажи про компанию Алисы и её конкурентов")
-print(f"  {result['answer']}")
-
-print("\n✅ JKG 7.1 работает!")
+if __name__ == "__main__":
+    main()

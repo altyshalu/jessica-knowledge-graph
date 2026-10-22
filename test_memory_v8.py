@@ -14,8 +14,8 @@ class MemoryV8Tests(unittest.TestCase):
         self.tmpdir.cleanup()
 
     def test_namespaces_are_physically_isolated(self):
-        alpha = HybridMemory(self.path, namespace="alpha")
-        beta = HybridMemory(self.path, namespace="beta")
+        alpha = HybridMemory(self.path, embedding_provider="hash", namespace="alpha")
+        beta = HybridMemory(self.path, embedding_provider="hash", namespace="beta")
         self.assertNotEqual(alpha.db_path, beta.db_path)
         alpha.remember_project("Alpha launch rule", project="alpha", canonical_key="alpha:rule")
         self.assertEqual(beta.list_semantic(), [])
@@ -23,7 +23,7 @@ class MemoryV8Tests(unittest.TestCase):
         beta.conn.close()
 
     def test_every_memory_layer_has_a_persisted_vector_index(self):
-        memory = HybridMemory(self.path)
+        memory = HybridMemory(self.path, embedding_provider="hash")
         if not memory.has_vec:
             self.skipTest("sqlite-vec unavailable")
         memory.remember_profile("My name is Alice")
@@ -35,7 +35,7 @@ class MemoryV8Tests(unittest.TestCase):
         memory.conn.close()
 
     def test_retrieval_changes_salience_not_truth_confidence(self):
-        memory = HybridMemory(self.path)
+        memory = HybridMemory(self.path, embedding_provider="hash")
         memory.remember("Alice loves concise answers")
         row = memory.conn.execute("SELECT id, confidence, salience FROM facts LIMIT 1").fetchone()
         memory._clark_confidence_update([{"fact_id": row["id"]}], boost=0.1)
@@ -45,7 +45,7 @@ class MemoryV8Tests(unittest.TestCase):
         memory.conn.close()
 
     def test_embedding_registry_requires_explicit_reindex(self):
-        memory = HybridMemory(self.path)
+        memory = HybridMemory(self.path, embedding_provider="hash")
         memory.remember_project("Persist this vector", project="jkg", canonical_key="jkg:vector")
         memory.conn.execute(
             "UPDATE memory_meta SET value='old-provider:old-model:384' WHERE key='embedding_signature'"
@@ -53,15 +53,15 @@ class MemoryV8Tests(unittest.TestCase):
         memory.conn.commit()
         memory.conn.close()
         with self.assertRaises(EmbeddingConfigurationError):
-            HybridMemory(self.path)
-        migrated = HybridMemory(self.path, reindex_on_mismatch=True)
+            HybridMemory(self.path, embedding_provider="hash")
+        migrated = HybridMemory(self.path, embedding_provider="hash", reindex_on_mismatch=True)
         self.assertEqual(
             migrated.conn.execute("SELECT COUNT(*) FROM memory_semantic_vec").fetchone()[0], 1
         )
         migrated.conn.close()
 
     def test_feedback_aliases_consolidation_and_context_budget(self):
-        memory = HybridMemory(self.path)
+        memory = HybridMemory(self.path, embedding_provider="hash")
         memory.remember("Alice loves concise answers")
         fact = memory.conn.execute("SELECT id FROM facts LIMIT 1").fetchone()
         self.assertEqual(memory.feedback("factual", fact["id"], "useful")["status"], "recorded")
@@ -72,7 +72,7 @@ class MemoryV8Tests(unittest.TestCase):
         memory.conn.close()
 
     def test_clark_astar_returns_most_reliable_optimal_path(self):
-        memory = HybridMemory(self.path)
+        memory = HybridMemory(self.path, embedding_provider="hash")
         a = memory._ensure_entity("alpha")
         b = memory._ensure_entity("beta")
         goal = memory._ensure_entity("goal")

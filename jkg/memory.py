@@ -19,26 +19,12 @@ from .config import (
     normalize_namespace,
 )
 from .lifecycle import ContextBudget, FeedbackSignal
-try:
-    from sentence_transformers import SentenceTransformer
-except Exception:
-    SentenceTransformer = None
+from .embeddings import EmbeddingEngine
+from .local_extraction import extract_assertions, profile_payload, statements
 
 # ═══════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════
-
-DB_PATH = os.path.expanduser(os.environ.get(
-    "JKG_DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_v3.db")
-))
-# Default: local SentenceTransformer (384-dim). Set GEMINI_API_KEY for Gemini (768-dim).
-_USE_GEMINI = bool(os.environ.get("GEMINI_API_KEY", ""))
-EMBEDDING_DIM = 768 if _USE_GEMINI else 384
-EMBEDDING_MODEL = os.environ.get(
-    "JKG_EMBEDDING_MODEL",
-    "gemini-embedding-001" if _USE_GEMINI else "all-MiniLM-L6-v2"
-)
 
 def _load_env():
     """Load .env from current dir, ~/.jkg/, or JKG_ENV_PATH."""
@@ -59,6 +45,11 @@ def _load_env():
                         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
             break
 _load_env()
+
+DB_PATH = os.path.expanduser(os.environ.get(
+    "JKG_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_v3.db")
+))
 
 API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 API_BASE = "https://api.deepseek.com"
@@ -100,31 +91,7 @@ def _slugify(text: str) -> str:
 
 
 def _fallback_profile_payload(text: str) -> dict:
-    raw = text.strip()
-    norm = raw.lower()
-    facts = []
-
-    role_match = re.search(r"\b(?:user|i)\s+is\s+(?:an?\s+)?(.+)$", norm)
-    if role_match:
-        role = role_match.group(1).strip(" .")
-        if role:
-            facts.append({
-                "key": "role",
-                "value": role,
-                "category": "identity",
-                "confidence": 0.7,
-            })
-
-    name_match = re.search(r"\bmy name is\s+([a-zA-Z][a-zA-Z\s'-]+)$", raw, re.IGNORECASE)
-    if name_match:
-        facts.append({
-            "key": "name",
-            "value": _title_case_name(name_match.group(1).strip(" .")),
-            "category": "identity",
-            "confidence": 0.8,
-        })
-
-    return {"facts": facts}
+    return profile_payload(text)
 
 
 def _fallback_semantic_payload(
@@ -161,35 +128,10 @@ def _fallback_semantic_payload(
 
 
 def _fallback_extract_temporal_payload(text: str) -> dict:
-    raw = text.strip()
-    facts = []
-    ref_years = re.findall(r"\b(19\d{2}|20\d{2})\b", raw)
-    reference_time = f"{ref_years[0]}-01-01" if ref_years else None
-
-    def add_fact(subject: str, predicate: str, obj: str, valid_from: str = None, valid_until: str = None):
-        facts.append({
-            "subject": subject,
-            "predicate": predicate,
-            "object": obj,
-            "valid_from": valid_from,
-            "valid_until": valid_until,
-        })
-
-    lived_match = re.search(r"^([A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*)*)\s+lived in\s+(.+?)\s+in\s+(\d{4})[\.!]?$", raw)
-    if lived_match:
-        subject, obj, year = lived_match.groups()
-        # Residence statements are open-ended until a later move/relocation invalidates them.
-        add_fact(subject, "lived_in", obj.strip(), f"{year}-01-01", None)
-
-    moved_match = re.search(r"^([A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*)*)\s+moved to\s+(.+?)\s+in\s+(\d{4})[\.!]?$", raw)
-    if moved_match:
-        subject, obj, year = moved_match.groups()
-        add_fact(subject, "lives_in", obj.strip(), f"{year}-01-01", None)
-
-    return {"reference_time": reference_time, "facts": facts}
+    return {"reference_time": None, "facts": extract_assertions(text)}
 
 
-def _fallback_extract_entities_payload(text: str) -> dict:
+def _legacy_extract_entities_payload(text: str) -> dict:
     raw = text.strip()
     entities = []
     entity_seen = set()
@@ -282,6 +224,31 @@ def _fallback_extract_entities_payload(text: str) -> dict:
     return {"entities": entities, "facts": facts, "relations": relations}
 
 
+def _fallback_extract_entities_payload(text: str) -> dict:
+    result = {"entities": [], "facts": [], "relations": []}
+    for sentence in statements(text):
+        assertions = extract_assertions(sentence)
+        if assertions:
+            for fact in assertions:
+                subject, obj, predicate = fact["subject"], fact["object"], fact["predicate"]
+                result["entities"].extend([
+                    {"name": subject, "type": "person"},
+                    {"name": obj, "type": fact["object_type"]},
+                ])
+                triple = {"subject": subject, "predicate": predicate, "object": obj}
+                result["facts"].append(triple)
+                result["relations"].append(triple.copy())
+        else:
+            # Retain older, narrow patterns without guessing unsupported clauses.
+            if re.search(r"\b(?:not|never|не|said|says|that|сказал|сказала|что)\b", sentence, re.I):
+                continue
+            legacy = _legacy_extract_entities_payload(sentence)
+            for key in result:
+                result[key].extend(legacy[key])
+    result["entities"] = list({e["name"].lower(): e for e in result["entities"]}.values())
+    return result
+
+
 # ═══════════════════════════════════════════════════
 # HYBRID MEMORY — Graph + Embeddings, one DB
 # ═══════════════════════════════════════════════════
@@ -289,10 +256,18 @@ def _fallback_extract_entities_payload(text: str) -> dict:
 class HybridMemory:
     """Unified five-layer memory backed by one SQLite database."""
 
-    def __init__(self, db_path=DB_PATH, embedding_model=EMBEDDING_MODEL,
-                 namespace: str = None, reindex_on_mismatch: bool = False):
+    def __init__(self, db_path=None, embedding_model=None,
+                 namespace: str = None, reindex_on_mismatch: bool = False,
+                 embedding_provider: str = None, embedding_dimensions: int = None):
         self.namespace = normalize_namespace(namespace)
-        db_path = namespace_db_path(db_path, self.namespace)
+        db_path = namespace_db_path(db_path if db_path is not None else os.environ.get("JKG_DB_PATH", DB_PATH), self.namespace)
+        self._embedding_engine = EmbeddingEngine(embedding_provider, embedding_model, embedding_dimensions)
+        self.config = MemoryConfig(
+            namespace=self.namespace, db_path=db_path,
+            embedding_provider=self._embedding_engine.provider,
+            embedding_model=self._embedding_engine.model,
+            embedding_dimensions=self._embedding_engine.dimensions,
+        )
         # Handle special SQLite paths like ":memory:"
         if db_path not in (":memory:", "") and os.path.dirname(db_path):
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -319,85 +294,21 @@ class HybridMemory:
 
         self._init_db()
 
-        # Lazy-load embedding model
-        self._embedder = None
-        self._embedder_name = embedding_model
-        provider = "gemini" if _USE_GEMINI else (
-            "sentence-transformers" if SentenceTransformer is not None else "hash"
-        )
-        model_name = embedding_model if provider != "hash" else "hash-v1"
-        self.config = MemoryConfig(
-            namespace=self.namespace,
-            db_path=db_path,
-            embedding_provider=provider,
-            embedding_model=model_name,
-            embedding_dimensions=EMBEDDING_DIM,
-        )
         self._validate_embedding_registry(reindex_on_mismatch=reindex_on_mismatch)
 
     @property
     def embedder(self):
-        if self._embedder is None:
-            if _USE_GEMINI:
-                self._embedder = self  # Gemini — use self.encode()
-            elif SentenceTransformer is None:
-                self._embedder = self  # deterministic local hash embeddings
-            else:
-                self._embedder = SentenceTransformer(self._embedder_name)
-        return self._embedder
+        return self._embedding_engine
 
-    def _hash_embed(self, text: str):
-        vec = np.zeros(EMBEDDING_DIM, dtype=np.float32)
-        tokens = re.findall(r"[^\s,?.!;:\"'()\[\]{}]+", str(text or "").lower())
-        if not tokens:
-            tokens = [str(text or "")]
-        for token in tokens:
-            digest = hashlib.sha256(token.encode("utf-8")).digest()
-            for idx in range(0, len(digest), 4):
-                bucket = int.from_bytes(digest[idx:idx + 4], "big") % EMBEDDING_DIM
-                vec[bucket] += 1.0
-        norm = np.linalg.norm(vec)
-        return vec / norm if norm > 0 else vec
-        
     def encode(self, texts, **kwargs):
-        """Unified encode: delegates to Gemini API or SentenceTransformer."""
-        import numpy as _np
-        
-        # If we're a SentenceTransformer instance (set by embedder property)
-        if SentenceTransformer is not None and isinstance(self._embedder, SentenceTransformer):
-            return self._embedder.encode(texts, normalize_embeddings=True, **kwargs)
-        if not _USE_GEMINI:
-            if isinstance(texts, str):
-                return self._hash_embed(texts)
-            return [self._hash_embed(text) for text in texts]
-        
-        # Gemini API path
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key or requests is None:
-            if isinstance(texts, str):
-                return self._hash_embed(texts)
-            return [self._hash_embed(text) for text in texts]
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={api_key}"
-        
-        def _call_gemini(text):
-            payload = {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": text}]}}
-            resp = requests.post(url, json=payload, timeout=EMBEDDING_TIMEOUT_SECONDS).json()
-            if "embedding" not in resp:
-                print(f"Error from Gemini API: {resp}", file=sys.stderr)
-                return _np.zeros(EMBEDDING_DIM, dtype=_np.float32)
-            vals = resp["embedding"]["values"]
-            dim = EMBEDDING_DIM
-            if len(vals) > dim:
-                vals = vals[:dim]
-            if len(vals) < dim:
-                vals = vals + [0.0] * (dim - len(vals))
-            return _np.array(vals, dtype=_np.float32)
-        
-        if isinstance(texts, str):
-            return _call_gemini(texts)
-        
-        return [_call_gemini(t) for t in texts]
+        return self._embedding_engine.encode(texts, **kwargs)
+
+    @staticmethod
+    def _distance_similarity(distance):
+        # vec0 uses Euclidean distance by default. For unit vectors:
+        # ||a-b||² = 2 - 2*cos(a,b). 1-distance is not cosine similarity.
+        return max(0.0, min(1.0, 1.0 - float(distance) ** 2 / 2.0))
+
     # SCHEMA — one DB, all tables
     # ═══════════════════════════════════════════════
 
@@ -615,7 +526,7 @@ class HybridMemory:
             self.conn.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS facts_vec USING vec0(
                     fact_id INTEGER PRIMARY KEY,
-                    embedding float[{EMBEDDING_DIM}]
+                    embedding float[{self.config.embedding_dimensions}]
                 )
             """)
             self.has_vec = True
@@ -633,7 +544,7 @@ class HybridMemory:
                     self.conn.execute(f"""
                         CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(
                             {id_column} INTEGER PRIMARY KEY,
-                            embedding float[{EMBEDDING_DIM}]
+                            embedding float[{self.config.embedding_dimensions}]
                         )
                     """)
                 except Exception:
@@ -674,10 +585,21 @@ class HybridMemory:
         if not self.has_vec:
             return
         vector = np.asarray(self._encode(text), dtype=np.float32)
-        self.conn.execute(
-            f"INSERT OR REPLACE INTO {table}({id_column}, embedding) VALUES(?,?)",
-            (row_id, vector.tobytes()),
-        )
+        # vec0 does not implement SQLite's INSERT OR REPLACE conflict policy.
+        # Replace explicitly and keep the previous vector if insertion fails.
+        self.conn.execute("SAVEPOINT vector_replace")
+        try:
+            self.conn.execute(f"DELETE FROM {table} WHERE {id_column}=?", (row_id,))
+            self.conn.execute(
+                f"INSERT INTO {table}({id_column}, embedding) VALUES(?,?)",
+                (row_id, vector.tobytes()),
+            )
+        except Exception:
+            self.conn.execute("ROLLBACK TO vector_replace")
+            self.conn.execute("RELEASE vector_replace")
+            raise
+        else:
+            self.conn.execute("RELEASE vector_replace")
 
     def reindex_embeddings(self, force: bool = False) -> dict:
         """Rebuild every vector layer and update the embedding registry."""
@@ -686,54 +608,61 @@ class HybridMemory:
         if not self.has_vec:
             raise RuntimeError("sqlite-vec is required to rebuild vector indexes")
 
-        tables = {
-            "facts_vec": "fact_id",
-            "memory_semantic_vec": "semantic_row_id",
-            "memory_profile_vec": "profile_row_id",
-            "memory_session_vec": "session_row_id",
-            "memory_skill_vec": "skill_row_id",
-        }
-        # vec0 fixes dimensions when a table is created. Recreate tables so a
-        # provider dimension change is a real migration rather than a corrupt mix.
-        for table in tables:
-            self.conn.execute(f"DROP TABLE IF EXISTS {table}")
-        for table, id_column in tables.items():
-            self.conn.execute(f"""
-                CREATE VIRTUAL TABLE {table} USING vec0(
-                    {id_column} INTEGER PRIMARY KEY,
-                    embedding float[{self.config.embedding_dimensions}]
-                )
-            """)
+        self.conn.execute("SAVEPOINT embedding_reindex")
+        try:
+            tables = {
+                "facts_vec": "fact_id",
+                "memory_semantic_vec": "semantic_row_id",
+                "memory_profile_vec": "profile_row_id",
+                "memory_session_vec": "session_row_id",
+                "memory_skill_vec": "skill_row_id",
+            }
+            # vec0 fixes dimensions when a table is created. Recreate tables so a
+            # provider dimension change is a real migration rather than a corrupt mix.
+            for table in tables:
+                self.conn.execute(f"DROP TABLE IF EXISTS {table}")
+            for table, id_column in tables.items():
+                self.conn.execute(f"""
+                    CREATE VIRTUAL TABLE {table} USING vec0(
+                        {id_column} INTEGER PRIMARY KEY,
+                        embedding float[{self.config.embedding_dimensions}]
+                    )
+                """)
 
-        counts = {name: 0 for name in ("facts", "semantic", "profile", "sessions", "skills")}
-        for row in self.conn.execute(
-            "SELECT f.id, e.name, f.predicate, f.object_text FROM facts f JOIN entities e ON e.id=f.subject_id"
-        ).fetchall():
-            self._replace_vector("facts_vec", "fact_id", row["id"],
-                                 f"{row['name']} {row['predicate']} {row['object_text']}")
-            counts["facts"] += 1
-        for row in self.conn.execute("SELECT * FROM memory_semantic").fetchall():
-            self._replace_vector("memory_semantic_vec", "semantic_row_id", row["id"],
-                                 f"{row['kind']} {row['scope']} {row['subject']} {row['statement']} {row['tags_json']}")
-            counts["semantic"] += 1
-        for row in self.conn.execute("SELECT * FROM memory_profile").fetchall():
-            self._replace_vector("memory_profile_vec", "profile_row_id", row["id"],
-                                 f"{row['key']} {row['value']} {row['category']}")
-            counts["profile"] += 1
-        for row in self.conn.execute("SELECT rowid AS vector_id, * FROM memory_sessions").fetchall():
-            self._replace_vector("memory_session_vec", "session_row_id", row["vector_id"],
-                                 f"{row['title']} {row['summary']} {row['full_text']}")
-            counts["sessions"] += 1
-        for row in self.conn.execute("SELECT rowid AS vector_id, * FROM memory_skills").fetchall():
-            self._replace_vector("memory_skill_vec", "skill_row_id", row["vector_id"],
-                                 f"{row['name']} {row['description']} {row['triggers']} {row['category']}")
-            counts["skills"] += 1
+            counts = {name: 0 for name in ("facts", "semantic", "profile", "sessions", "skills")}
+            for row in self.conn.execute(
+                "SELECT f.id, e.name, f.predicate, f.object_text FROM facts f JOIN entities e ON e.id=f.subject_id"
+            ).fetchall():
+                self._replace_vector("facts_vec", "fact_id", row["id"],
+                                     f"{row['name']} {row['predicate']} {row['object_text']}")
+                counts["facts"] += 1
+            for row in self.conn.execute("SELECT * FROM memory_semantic").fetchall():
+                self._replace_vector("memory_semantic_vec", "semantic_row_id", row["id"],
+                                     f"{row['kind']} {row['scope']} {row['subject']} {row['statement']} {row['tags_json']}")
+                counts["semantic"] += 1
+            for row in self.conn.execute("SELECT * FROM memory_profile").fetchall():
+                self._replace_vector("memory_profile_vec", "profile_row_id", row["id"],
+                                     f"{row['key']} {row['value']} {row['category']}")
+                counts["profile"] += 1
+            for row in self.conn.execute("SELECT rowid AS vector_id, * FROM memory_sessions").fetchall():
+                self._replace_vector("memory_session_vec", "session_row_id", row["vector_id"],
+                                     f"{row['title']} {row['summary']} {row['full_text']}")
+                counts["sessions"] += 1
+            for row in self.conn.execute("SELECT rowid AS vector_id, * FROM memory_skills").fetchall():
+                self._replace_vector("memory_skill_vec", "skill_row_id", row["vector_id"],
+                                     f"{row['name']} {row['description']} {row['triggers']} {row['category']}")
+                counts["skills"] += 1
 
-        self.conn.execute(
-            "INSERT OR REPLACE INTO memory_meta(key,value,updated_at) VALUES('embedding_signature',?,datetime('now'))",
-            (self.config.embedding_signature,),
-        )
-        self.conn.commit()
+            self.conn.execute(
+                "INSERT OR REPLACE INTO memory_meta(key,value,updated_at) VALUES('embedding_signature',?,datetime('now'))",
+                (self.config.embedding_signature,),
+            )
+        except Exception:
+            self.conn.execute("ROLLBACK TO embedding_reindex")
+            self.conn.execute("RELEASE embedding_reindex")
+            raise
+        else:
+            self.conn.execute("RELEASE embedding_reindex")
         return {"status": "ok", "embedding_signature": self.config.embedding_signature, "indexed": counts}
 
     # ═══════════════════════════════════════════════
@@ -994,7 +923,12 @@ FOR EVERY fact that describes a job/position/role change:
 JSON:"""
         try:
             result = _llm(prompt, "Extract temporal info. Output JSON only.")
-            return json.loads(result)
+            data = json.loads(result)
+            if not isinstance(data, dict) or not isinstance(data.get("facts"), list):
+                raise ValueError("Invalid temporal extraction payload")
+            if any(not isinstance(f, dict) for f in data["facts"]):
+                raise ValueError("Invalid temporal fact")
+            return data
         except Exception:
             return _fallback_extract_temporal_payload(text)
 
@@ -1185,6 +1119,8 @@ JSON:"""
                         seen.add(s["subject_id"])
                         candidates.append({"id": s["subject_id"], "name": s["name"],
                                           "type": s["type"], "distance": s["distance"]})
+            except EmbeddingConfigurationError:
+                raise
             except Exception:
                 pass
 
@@ -1541,6 +1477,8 @@ JSON:"""
                  title: str = "", reference_time: str = None) -> dict:
         """JKG 5.0: Extract + store with EMOTION, BI-TEMPORAL, SELF-EVOLVING."""
         import uuid as _uuid
+        if not text.strip():
+            raise ValueError("Memory text must not be empty")
 
         # ── EPISODE with EMOTION ──
         ep_uuid = str(_uuid.uuid4())
@@ -1549,7 +1487,7 @@ JSON:"""
         cur = self.conn.execute(
             "INSERT INTO episodes(uuid, title, body, source_type, reference_time, emotion, emotion_intensity) "
             "VALUES(?,?,?,?,?,?,?)",
-            (ep_uuid, title or text[:80], text[:5000], source, ref_time, emotion, emotion_intensity))
+            (ep_uuid, title or text[:80], text, source, ref_time, emotion, emotion_intensity))
         episode_id = cur.lastrowid
 
         # ── TEMPORAL EXTRACTION ──
@@ -1620,18 +1558,6 @@ JSON:"""
                 vfrom = tf.get("valid_from") or temp_ref
                 vuntil = tf.get("valid_until")
 
-                # Fix: LLM often over-fits "in YEAR" as "ended in YEAR" for residence/employment.
-                # If valid_until is in the same year as valid_from, reset to NULL —
-                # conflict resolution (_invalidate_with_edge) will correctly close it later.
-                if vuntil and pred in (
-                    self._RESIDENCE_PREDICATES | self._RESIDENCE_TRANSITION_PREDICATES |
-                    self._EMPLOYMENT_PREDICATES
-                ):
-                    vf_dt = self._parse_partial_date(vfrom, default_end=False)
-                    vu_dt = self._parse_partial_date(vuntil, default_end=True)
-                    if vf_dt and vu_dt and vf_dt.year == vu_dt.year:
-                        vuntil = None  # Open-ended; conflict resolution will close when superseded
-
                 # Find conflicts before insert so the new fact can explicitly supersede them
                 conflicting_fact_ids = self._find_conflicting_fact_ids(subj, pred, obj)
 
@@ -1663,10 +1589,12 @@ JSON:"""
                 sid = self.resolve_entity(subj)
                 oid = self.resolve_entity(obj)
                 pred = rel.get("predicate", "related_to")
-                self.conn.execute(
-                    "INSERT INTO relations(subject_id, predicate, object_id, source) VALUES(?,?,?,?)",
-                    (sid, pred, oid, source))
-                stored["relations"] += 1
+                cursor = self.conn.execute(
+                    "INSERT INTO relations(subject_id, predicate, object_id, source) "
+                    "SELECT ?,?,?,? WHERE NOT EXISTS ("
+                    "SELECT 1 FROM relations WHERE subject_id=? AND predicate=? AND object_id=?)",
+                    (sid, pred, oid, source, sid, pred, oid))
+                stored["relations"] += cursor.rowcount
 
             # Auto-ground
             if ground_to:
@@ -1677,30 +1605,37 @@ JSON:"""
                             "INSERT OR IGNORE INTO relations(subject_id, predicate, object_id, source) VALUES(?,?,?,?)",
                             (gid, "connected_to", eid, "auto-ground"))
 
-        # VECTORS
-        if self.has_vec and new_fact_ids:
-            for fid in new_fact_ids:
-                try:
-                    fact = self.conn.execute(
-                        "SELECT f.predicate, f.object_text, e.name FROM facts f "
-                        "JOIN entities e ON f.subject_id = e.id WHERE f.id=?",
-                        (fid,)).fetchone()
-                    if fact:
-                        fact_text = f"{fact['name']} {fact['predicate']} {fact['object_text']}"
-                        vec = self._encode(fact_text)
-                        self.conn.execute(
-                            "INSERT OR REPLACE INTO facts_vec(fact_id, embedding) VALUES(?,?)",
-                            (fid, vec.tobytes()))
-                        stored["vectors"] += 1
-                except Exception:
-                    pass
+            # VECTORS
+            if self.has_vec and new_fact_ids:
+                for fid in new_fact_ids:
+                    try:
+                        fact = self.conn.execute(
+                            "SELECT f.predicate, f.object_text, e.name FROM facts f "
+                            "JOIN entities e ON f.subject_id = e.id WHERE f.id=?",
+                            (fid,)).fetchone()
+                        if fact:
+                            fact_text = f"{fact['name']} {fact['predicate']} {fact['object_text']}"
+                            vec = self._encode(fact_text)
+                            self.conn.execute(
+                                "INSERT INTO facts_vec(fact_id, embedding) VALUES(?,?)",
+                                (fid, vec.tobytes()))
+                            stored["vectors"] += 1
+                    except EmbeddingConfigurationError:
+                        raise
+                    except Exception:
+                        raise
 
-        # Rebuild FTS
-        try:
-            self.conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
-            self.conn.commit()
-        except: pass
+            # Rebuild FTS
+            try:
+                self.conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+            except Exception:
+                raise
 
+        stored["extraction_status"] = "structured" if stored["facts"] or stored["relations"] else (
+            "duplicate" if stored["duplicates"] else "raw_only"
+        )
+        if stored["extraction_status"] == "raw_only":
+            stored["warning"] = "Text saved as an episode; no structured facts were recognized."
         return stored
 
     # ═══════════════════════════════════════════════
@@ -1874,6 +1809,8 @@ JSON:"""
                          "vector_distance": vec_distance[f["id"]]}
                         for f in fact_data
                     ])
+            except EmbeddingConfigurationError:
+                raise
             except Exception:
                 pass
 
@@ -2215,7 +2152,7 @@ JSON:"""
             ).fetchall()
             for row in rows:
                 distance = max(0.0, float(row["distance"]))
-                vector_scores[row["fact_id"]] = 1.0 / (1.0 + distance)
+                vector_scores[row["fact_id"]] = self._distance_similarity(distance)
                 seed_fact_ids.add(row["fact_id"])
                 seed_relevance[row["fact_id"]] = vector_scores[row["fact_id"]]
         except Exception:
@@ -2253,7 +2190,11 @@ JSON:"""
         )
         entity_ids = list(astar)
         entity_placeholders = ",".join("?" for _ in entity_ids)
-        active_clause = "" if include_historical else "AND f.forget_status='active'"
+        active_clause = "" if include_historical else (
+            "AND f.forget_status='active' AND f.superseded_by IS NULL "
+            "AND (f.valid_until IS NULL OR f.valid_until >= date('now')) "
+            "AND (f.valid_from IS NULL OR f.valid_from <= date('now'))"
+        )
         facts = self.conn.execute(
             f"SELECT f.id, f.subject_id, f.predicate, f.object_text, f.confidence, "
             f"f.valid_from, f.valid_until, e.name AS entity_name "
@@ -2283,6 +2224,8 @@ JSON:"""
                     denominator = np.linalg.norm(query_array) * np.linalg.norm(fact_array)
                     similarity = float(np.dot(query_array, fact_array) / denominator) if denominator else 0.0
                     vector_scores[fact["id"]] = max(0.0, min(1.0, similarity))
+            except EmbeddingConfigurationError:
+                raise
             except Exception:
                 pass
 
@@ -2850,7 +2793,9 @@ JSON:"""
 
     def remember_profile(self, text: str, category: str = "preference",
                          source: str = "explicit") -> dict:
-        """Extract user profile/preference facts via LLM and store in memory_profile."""
+        """Store explicit preferences; preserve unsupported input as a raw episode."""
+        if not text.strip():
+            raise ValueError("Profile text must not be empty")
         prompt = f"""Extract profile facts about the user from this text. Output ONLY valid JSON.
 
 Text: {text[:2000]}
@@ -2876,35 +2821,46 @@ JSON:"""
             data = _fallback_profile_payload(text)
 
         stored = []
-        for f in data.get("facts", []):
-            key = f["key"].lower().replace(" ", "_")
-            value = f["value"]
-            cat = f.get("category", category)
-            conf = f.get("confidence", 0.9)
+        if (not isinstance(data, dict) or not isinstance(data.get("facts"), list)
+                or any(not isinstance(f, dict) or not isinstance(f.get("key"), str)
+                       or not isinstance(f.get("value"), str) for f in data.get("facts", []))):
+            data = _fallback_profile_payload(text)
+        if not data.get("facts"):
+            raw = self.remember(text, source=f"profile:{source}")
+            return {"status": "no_profile_facts", "stored": 0, "facts": [],
+                    "episode_id": raw["episode_id"], "extraction_status": "raw_only",
+                    "warning": "Original text retained as an episode; no profile facts recognized."}
+        with self.conn:
+            for f in data.get("facts", []):
+                key = f["key"].lower().replace(" ", "_")
+                value = f["value"]
+                cat = f.get("category", category)
+                conf = f.get("confidence", 0.9)
 
-            # Upsert: replace if exists
-            self.conn.execute("""
-                INSERT INTO memory_profile(key, value, category, confidence, source, updated_at)
-                VALUES (?, ?, ?, ?, ?, datetime('now'))
-                ON CONFLICT(key) DO UPDATE SET
-                    value=excluded.value, category=excluded.category,
-                    confidence=excluded.confidence, source=excluded.source,
-                    updated_at=datetime('now')
-            """, (key, value, cat, conf, source))
-            row = self.conn.execute(
-                "SELECT id FROM memory_profile WHERE key=?", (key,)
-            ).fetchone()
-            if row:
-                try:
-                    self._replace_vector(
-                        "memory_profile_vec", "profile_row_id", row["id"],
-                        f"{key} {value} {cat}",
-                    )
-                except Exception:
-                    pass
-            stored.append({"key": key, "value": value, "category": cat})
+                # Upsert: replace if exists
+                self.conn.execute("""
+                    INSERT INTO memory_profile(key, value, category, confidence, source, updated_at)
+                    VALUES (?, ?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(key) DO UPDATE SET
+                        value=excluded.value, category=excluded.category,
+                        confidence=excluded.confidence, source=excluded.source,
+                        updated_at=datetime('now'), is_active=1
+                """, (key, value, cat, conf, source))
+                row = self.conn.execute(
+                    "SELECT id FROM memory_profile WHERE key=?", (key,)
+                ).fetchone()
+                if row:
+                    try:
+                        self._replace_vector(
+                            "memory_profile_vec", "profile_row_id", row["id"],
+                            f"{key} {value} {cat}",
+                        )
+                    except EmbeddingConfigurationError:
+                        raise
+                    except Exception:
+                        raise
+                stored.append({"key": key, "value": value, "category": cat})
 
-        self.conn.commit()
         return {"status": "ok", "stored": len(stored), "facts": stored}
 
     def get_profile(self, category: str = None) -> list:
@@ -2969,48 +2925,46 @@ JSON:"""
             (key,),
         ).fetchone()
 
-        if existing:
-            self.conn.execute("""
-                UPDATE memory_semantic
-                SET kind=?, scope=?, subject=?, statement=?, details_json=?, tags_json=?,
-                    confidence=?, source=?, status='active', updated_at=datetime('now'),
-                    last_reinforced_at=datetime('now')
-                WHERE canonical_key=?
-            """, (
-                normalized_kind, normalized_scope, normalized_subject, normalized_statement,
-                details_json, tags_json, float(confidence), source, key,
-            ))
-            row_id = existing["id"]
-            action = "updated"
-        else:
-            cur = self.conn.execute("""
-                INSERT INTO memory_semantic(
-                    semantic_id, kind, scope, subject, canonical_key, statement,
-                    details_json, tags_json, confidence, source
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                semantic_id, normalized_kind, normalized_scope, normalized_subject, key,
-                normalized_statement, details_json, tags_json, float(confidence), source,
-            ))
-            row_id = cur.lastrowid
-            action = "created"
+        with self.conn:
+            if existing:
+                self.conn.execute("""
+                    UPDATE memory_semantic
+                    SET kind=?, scope=?, subject=?, statement=?, details_json=?, tags_json=?,
+                        confidence=?, source=?, status='active', updated_at=datetime('now'),
+                        last_reinforced_at=datetime('now')
+                    WHERE canonical_key=?
+                """, (
+                    normalized_kind, normalized_scope, normalized_subject, normalized_statement,
+                    details_json, tags_json, float(confidence), source, key,
+                ))
+                row_id = existing["id"]
+                action = "updated"
+            else:
+                cur = self.conn.execute("""
+                    INSERT INTO memory_semantic(
+                        semantic_id, kind, scope, subject, canonical_key, statement,
+                        details_json, tags_json, confidence, source
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    semantic_id, normalized_kind, normalized_scope, normalized_subject, key,
+                    normalized_statement, details_json, tags_json, float(confidence), source,
+                ))
+                row_id = cur.lastrowid
+                action = "created"
 
-        if self.has_vec:
-            try:
-                semantic_text = " ".join([
-                    normalized_kind, normalized_scope, normalized_subject,
-                    normalized_statement, " ".join(json.loads(tags_json)),
-                ]).strip()
-                vec = self._encode(semantic_text)
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO memory_semantic_vec(semantic_row_id, embedding) VALUES(?,?)",
-                    (row_id, vec.tobytes()),
-                )
-            except Exception:
-                pass
+            if self.has_vec:
+                try:
+                    semantic_text = " ".join([
+                        normalized_kind, normalized_scope, normalized_subject,
+                        normalized_statement, " ".join(json.loads(tags_json)),
+                    ]).strip()
+                    self._replace_vector("memory_semantic_vec", "semantic_row_id", row_id, semantic_text)
+                except EmbeddingConfigurationError:
+                    raise
+                except Exception:
+                    raise
 
-        self.conn.commit()
         return {
             "status": "ok",
             "action": action,
@@ -3177,7 +3131,7 @@ JSON:"""
 
     def search_semantic(self, query: str, limit: int = 8, kind: str = None) -> list:
         norm_q = self._norm(query)
-        terms = [term for term in re.findall(r"[a-zA-Zа-яА-Я0-9_]+", norm_q) if len(term) > 1]
+        terms = self._search_terms(query)
         base_rows = self.list_semantic(kind=kind, limit=250)
         if not base_rows:
             return []
@@ -3223,7 +3177,7 @@ JSON:"""
                     row = by_id.get(vector_row["semantic_row_id"])
                     if not row or row["id"] in existing_ids:
                         continue
-                    cosine = max(0.0, 1.0 - float(vector_row["distance"]))
+                    cosine = self._distance_similarity(vector_row["distance"])
                     if terms and cosine < 0.18:
                         continue
                     item = dict(row)
@@ -3231,6 +3185,8 @@ JSON:"""
                     item["cosine_sim"] = cosine
                     item["score"] = round((item.get("confidence", 0.5) * 0.45) + (cosine * 0.45), 4)
                     results.append(item)
+            except EmbeddingConfigurationError:
+                raise
             except Exception:
                 pass
 
@@ -3285,6 +3241,8 @@ JSON:"""
                     "memory_session_vec", "session_row_id", session_row["vector_id"],
                     f"{title} {summary} {text[:10000]}",
                 )
+            except EmbeddingConfigurationError:
+                raise
             except Exception:
                 pass
         self.conn.commit()
@@ -3299,6 +3257,8 @@ JSON:"""
                 "UPDATE memory_sessions SET fact_count=? WHERE id=?",
                 (facts_extracted, sid))
             self.conn.commit()
+        except EmbeddingConfigurationError:
+            raise
         except Exception:
             pass
 
@@ -3342,8 +3302,10 @@ JSON:"""
                     if row["id"] in known:
                         continue
                     item = dict(row)
-                    item["retrieval_score"] = max(0.0, 1.0 - float(item.pop("distance")))
+                    item["retrieval_score"] = self._distance_similarity(item.pop("distance"))
                     results.append(item)
+            except EmbeddingConfigurationError:
+                raise
             except Exception:
                 pass
 
@@ -3385,6 +3347,8 @@ JSON:"""
                     "memory_skill_vec", "skill_row_id", skill_row["vector_id"],
                     f"{name} {description} {triggers_json} {category}",
                 )
+            except EmbeddingConfigurationError:
+                raise
             except Exception:
                 pass
 
@@ -3426,8 +3390,10 @@ JSON:"""
                         continue
                     item = dict(row)
                     item["triggers"] = json.loads(item.get("triggers", "[]"))
-                    item["retrieval_score"] = max(0.0, 1.0 - float(item.pop("distance")))
+                    item["retrieval_score"] = self._distance_similarity(item.pop("distance"))
                     results.append(item)
+            except EmbeddingConfigurationError:
+                raise
             except Exception:
                 pass
         results.sort(key=lambda item: item.get("retrieval_score", 0.0), reverse=True)
@@ -3527,6 +3493,8 @@ JSON:"""
                 semantic_results = self.search_semantic(text, limit=limit)
                 by_layer["semantic"] = len(semantic_results)
                 all_results.extend(semantic_results)
+            except EmbeddingConfigurationError:
+                raise
             except Exception as exc:
                 by_layer["semantic"] = 0
                 errors["semantic"] = str(exc)[:200]
@@ -3567,7 +3535,7 @@ JSON:"""
                     if rows:
                         scored = []
                         for p in rows:
-                            sim = max(0.0, 1.0 - float(p["distance"]))
+                            sim = self._distance_similarity(p["distance"])
                             if sim < 0.18:
                                 continue
                             d = dict(p)
@@ -3577,6 +3545,8 @@ JSON:"""
                             scored.append(d)
                         scored.sort(key=lambda x: x["score"], reverse=True)
                         profile_results = scored[:limit]
+                except EmbeddingConfigurationError:
+                    raise
                 except Exception:
                     pass
 
@@ -3607,7 +3577,8 @@ JSON:"""
                         r.get("predicate", ""),
                         r.get("value", r.get("object_text", ""))
                     )
-                    if lexical_bonus <= 0 and len(re.findall(r"[a-zA-Zа-яА-Я0-9_]+", self._norm(text))) >= 3:
+                    if (lexical_bonus <= 0 and (self.config.embedding_provider == "hash" or r.get("cosine_sim", 0) < 0.4)
+                            and len(re.findall(r"[a-zA-Zа-яА-Я0-9_]+", self._norm(text))) >= 3):
                         continue
                     base_score = r.get("clark_score", r.get("confidence", 0.5))
                     r["score"] = float(base_score) + lexical_bonus
@@ -3648,6 +3619,8 @@ JSON:"""
                     factual_results = filtered_factual[:limit]
                 by_layer["factual"] = len(factual_results)
                 all_results.extend(factual_results)
+            except EmbeddingConfigurationError:
+                raise
             except Exception as e:
                 # Fallback to RRF recall
                 errors["factual_clark"] = str(e)[:200]
@@ -3672,6 +3645,8 @@ JSON:"""
                     factual_results = filtered_factual[:limit]
                     by_layer["factual"] = len(factual_results)
                     all_results.extend(factual_results)
+                except EmbeddingConfigurationError:
+                    raise
                 except Exception as fallback_exc:
                     by_layer["factual"] = 0
                     errors["factual"] = str(fallback_exc)[:200]
@@ -3702,6 +3677,8 @@ JSON:"""
                     ))
                 by_layer["episodic"] = len(ep_results)
                 all_results.extend(ep_results)
+            except EmbeddingConfigurationError:
+                raise
             except Exception as exc:
                 by_layer["episodic"] = 0
                 errors["episodic"] = str(exc)[:200]
@@ -3716,6 +3693,8 @@ JSON:"""
                     r["score"] = min(1.0, 0.4 + 0.6 * self._lexical_similarity(text, searchable))
                 by_layer["procedural"] = len(sk_results)
                 all_results.extend(sk_results)
+            except EmbeddingConfigurationError:
+                raise
             except Exception as exc:
                 by_layer["procedural"] = 0
                 errors["procedural"] = str(exc)[:200]
@@ -3725,6 +3704,8 @@ JSON:"""
 
         return {
             "query": text,
+            "embedding_provider": self.config.embedding_provider,
+            "semantic_search": self.config.embedding_provider != "hash",
             "layers_searched": layers,
             "total_candidates": sum(by_layer.values()),
             "by_layer": by_layer,
@@ -3974,7 +3955,18 @@ CRITICAL: For EVERY fact, ALSO create a relation linking entities.
 Example: "Altynai's Instagram is blocked" → fact: instagram is_blocked, relation: altynai owns instagram
 JSON:"""
     try:
-        return _llm(prompt, "You extract knowledge graph triples. Always create relations. Output JSON only.")
+        raw = _llm(prompt, "You extract knowledge graph triples. Always create relations. Output JSON only.")
+        data = json.loads(raw.strip().removeprefix("```json").removesuffix("```").strip())
+        if not isinstance(data, dict):
+            raise ValueError("Expected an extraction object")
+        for key, fields in {"entities": ("name",), "facts": ("subject", "predicate", "object"),
+                            "relations": ("subject", "predicate", "object")}.items():
+            if not isinstance(data.get(key), list) or any(
+                not isinstance(item, dict) or any(not isinstance(item.get(field), str) for field in fields)
+                for item in data[key]
+            ):
+                raise ValueError(f"Invalid extraction field: {key}")
+        return json.dumps(data, ensure_ascii=False)
     except Exception:
         return json.dumps(_fallback_extract_entities_payload(text), ensure_ascii=False)
 
